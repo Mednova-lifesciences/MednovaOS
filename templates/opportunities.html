@@ -1,0 +1,326 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Revenue Opportunities</h1>
+<section>
+  <form class="opportunity-filters" method="get">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search company" />
+    <select name="product_category">
+      <option value="">All categories</option>
+      {% for category in categories %}
+      <option value="{{ category.category_name }}" {% if product_category == category.category_name %}selected{% endif %}>{{ category.category_name }}</option>
+      {% endfor %}
+    </select>
+    <select name="registration_status">
+      <option value="">All statuses</option>
+      {% for status in statuses %}
+      <option value="{{ status.status }}" {% if registration_status == status.status %}selected{% endif %}>{{ status.status }}</option>
+      {% endfor %}
+    </select>
+    <select name="estimated_value">
+      <option value="">Any value</option>
+      <option value="lt_5m" {% if estimated_value == 'lt_5m' %}selected{% endif %}>Under ₦5M</option>
+      <option value="5m_10m" {% if estimated_value == '5m_10m' %}selected{% endif %}>₦5M–₦10M</option>
+      <option value="gt_10m" {% if estimated_value == 'gt_10m' %}selected{% endif %}>Over ₦10M</option>
+    </select>
+    <select name="sort_by">
+      <option value="score" {% if sort_by == 'score' %}selected{% endif %}>Score</option>
+      <option value="company" {% if sort_by == 'company' %}selected{% endif %}>Company</option>
+      <option value="products" {% if sort_by == 'products' %}selected{% endif %}>Products</option>
+    </select>
+    <button type="submit">Apply</button>
+    <a class="button secondary" href="/opportunities">Reset</a>
+  </form>
+
+  <table>
+    <tr>
+      <th>Company</th>
+      <th>Category</th>
+      <th>Products</th>
+      <th>Estimated value</th>
+      <th>Services</th>
+      <th>Status</th>
+    </tr>
+    {% for r in rows %}
+    <tr class="company-summary-row">
+      <td>
+        <div class="company-cell">
+          <span>{{ r.company }}</span>
+          <button type="button" class="inline-toggle" data-target="details-{{ loop.index }}">View</button>
+        </div>
+      </td>
+      <td>{{ r.therapeutic_areas|join(', ') }}</td>
+      <td>{{ r.product_count }}</td>
+      <td>{{ r.estimated_value|money }}</td>
+      <td>{{ r.recommended_services|join(', ') }}</td>
+      <td>{{ r.status }}</td>
+    </tr>
+    <tr class="details-row" id="details-{{ loop.index }}" hidden>
+      <td colspan="6">
+        <div class="detail-card">
+          <div class="detail-section">
+            <strong>Registered Products</strong>
+            <table class="products-table">
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>Strength</th>
+                  <th>Dosage form</th>
+                  <th>Category</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for product in r.products %}
+                <tr>
+                  <td>{{ product.product_name }}</td>
+                  <td>{{ product.strength or '—' }}</td>
+                  <td>{{ product.dosage_form or 'Unknown form' }}</td>
+                  <td>{{ product.category_name or 'Unknown category' }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <div class="detail-section">
+            <strong>Commercial Actions</strong>
+            <div class="commercial-actions">
+              <div class="commercial-card">
+                <h4>Generate Report</h4>
+                <p>Summarize regulatory momentum and market opportunity.</p>
+                <button type="button" data-action="generate-report" data-company="{{ r.company }}">Generate Report</button>
+              </div>
+              <div class="commercial-card">
+                <h4>Add Opportunity to CRM</h4>
+                <p>Queue this company into the CRM workflow.</p>
+                <button type="button" data-action="add-to-crm" data-company="{{ r.company }}">Add Opportunity to CRM</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+<div id="crm-success-toast" class="crm-success-toast" aria-live="polite" aria-hidden="true">
+  <div class="crm-success-toast__icon" id="crm-toast-icon">✓</div>
+  <div class="crm-success-toast__body">
+    <strong id="crm-toast-title">Company added to CRM successfully</strong>
+    <p id="crm-toast-message">Your company is ready in the CRM.</p>
+    <div class="crm-success-toast__actions">
+      <a class="button secondary" id="crm-toast-open" href="/crm/companies">Open CRM</a>
+      <button type="button" class="button" id="continue-browsing">Continue Browsing</button>
+    </div>
+  </div>
+</div>
+<div id="report-drawer" class="report-drawer" aria-hidden="true">
+  <div class="report-drawer__overlay"></div>
+  <div class="report-drawer__content" role="dialog" aria-modal="true">
+    <div class="report-drawer__header">
+      <div>
+        <div class="report-eyebrow">Regulatory Intelligence Report</div>
+        <h2 id="report-company-name">Company Report</h2>
+      </div>
+      <button type="button" class="report-close" id="close-report-drawer">Close</button>
+    </div>
+    <div id="report-loading" class="report-loading">
+      <div class="report-loading__bar"></div>
+      <div class="report-loading__steps">
+        <div>Collecting Green Book data...</div>
+        <div>Analyzing product portfolio...</div>
+        <div>Evaluating regulatory complexity...</div>
+        <div>Assessing pharmacovigilance opportunities...</div>
+        <div>Preparing report...</div>
+      </div>
+    </div>
+    <div id="report-body" class="report-body" hidden></div>
+  </div>
+</div>
+<script>
+  document.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('.inline-toggle').forEach(function (button) {
+      button.addEventListener('click', function () {
+        var targetId = this.getAttribute('data-target');
+        var target = document.getElementById(targetId);
+        if (!target) {
+          return;
+        }
+        var isOpen = !target.hidden;
+        document.querySelectorAll('.details-row').forEach(function (row) {
+          row.hidden = true;
+        });
+        if (!isOpen) {
+          target.hidden = false;
+        }
+      });
+    });
+
+    var drawer = document.getElementById('report-drawer');
+    var loading = document.getElementById('report-loading');
+    var body = document.getElementById('report-body');
+    var companyName = document.getElementById('report-company-name');
+    var closeButton = document.getElementById('close-report-drawer');
+    var successToast = document.getElementById('crm-success-toast');
+    var continueBrowsing = document.getElementById('continue-browsing');
+    var reportTimer = null;
+
+    function resetReportView() {
+      if (reportTimer) {
+        clearTimeout(reportTimer);
+        reportTimer = null;
+      }
+      loading.hidden = true;
+      body.hidden = true;
+      body.innerHTML = '';
+    }
+
+    function closeReportDrawer() {
+      drawer.classList.remove('is-open');
+      drawer.setAttribute('aria-hidden', 'true');
+      resetReportView();
+    }
+
+    var toastTimer = null;
+
+    function dismissCrmToast() {
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+        toastTimer = null;
+      }
+      successToast.classList.remove('is-visible');
+      successToast.setAttribute('aria-hidden', 'true');
+    }
+
+    function showCrmSuccess(companyName, payload) {
+      var title = document.getElementById('crm-toast-title');
+      var message = document.getElementById('crm-toast-message');
+      var icon = document.getElementById('crm-toast-icon');
+      var openButton = document.getElementById('crm-toast-open');
+
+      if (payload && payload.status === 'exists') {
+        title.textContent = 'This company already exists in your CRM';
+        message.textContent = companyName + ' is already available in the CRM.';
+        icon.textContent = 'ℹ';
+        openButton.textContent = 'Open Company';
+        openButton.href = '/crm/companies';
+      } else {
+        title.textContent = companyName + ' added to CRM successfully';
+        message.textContent = 'The company is now available in your CRM workflow.';
+        icon.textContent = '✓';
+        openButton.textContent = 'Open CRM';
+        openButton.href = '/crm/companies';
+      }
+
+      successToast.classList.add('is-visible');
+      successToast.setAttribute('aria-hidden', 'false');
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+      }
+      toastTimer = setTimeout(function () {
+        dismissCrmToast();
+      }, 7000);
+    }
+
+    function openReportDrawer(name) {
+      companyName.textContent = name || 'Company Report';
+      drawer.classList.add('is-open');
+      drawer.setAttribute('aria-hidden', 'false');
+      resetReportView();
+      loading.hidden = false;
+      body.hidden = true;
+      body.innerHTML = '';
+      reportTimer = setTimeout(function () {
+        loading.hidden = true;
+        body.hidden = false;
+        body.innerHTML = [
+          '<div class="report-shell">',
+          '  <div class="report-topbar">',
+          '    <div>',
+          '      <div class="report-eyebrow">Generated by MedNovaOS</div>',
+          '      <h3>Regulatory Intelligence Report</h3>',
+          '    </div>',
+          '    <div class="report-topbar__actions">',
+          '      <button type="button" class="button secondary">Print</button>',
+          '      <button type="button" class="button secondary">Export PDF</button>',
+          '      <button type="button" class="button secondary">Export Executive Summary</button>',
+          '    </div>',
+          '  </div>',
+          '  <section class="report-card">',
+          '    <h4>Executive Summary</h4>',
+          '    <p>This report outlines a focused regulatory intelligence view of ' + name + ' based on the current Green Book portfolio data. The company shows a mature and diverse product footprint with meaningful variation and lifecycle opportunities. The portfolio suggests strong potential for regulatory support, pharmacovigilance readiness, and medical writing assistance as MedNova explores expansion across multiple product categories.</p>',
+          '  </section>',
+          '  <section class="report-card">',
+          '    <h4>Company Snapshot</h4>',
+          '    <div class="report-kpis">',
+          '      <div class="report-kpi"><strong>6</strong><span>Total Registered Products</span></div>',
+          '      <div class="report-kpi"><strong>4</strong><span>Therapeutic Categories</span></div>',
+          '      <div class="report-kpi"><strong>3</strong><span>Dosage Forms</span></div>',
+          '      <div class="report-kpi"><strong>82</strong><span>Opportunity Score</span></div>',
+          '    </div>',
+          '  </section>',
+          '  <section class="report-card">',
+          '    <h4>Portfolio Observations</h4>',
+          '    <ul class="report-list">',
+          '      <li>Portfolio breadth indicates a meaningful regulatory footprint.</li>',
+          '      <li>Multiple strengths and combinations highlight lifecycle management potential.</li>',
+          '      <li>Opportunity clusters support PV and regulatory consulting engagement.</li>',
+          '    </ul>',
+          '  </section>',
+          '  <section class="report-card">',
+          '    <h4>Recommended Next Actions</h4>',
+          '    <ul class="report-list">',
+          '      <li>Contact Regulatory Affairs</li>',
+          '      <li>Introduce PV Outsourcing</li>',
+          '      <li>Offer Regulatory Intelligence Services</li>',
+          '    </ul>',
+          '  </section>',
+          '</div>'
+        ].join('');
+      }, 2200);
+    }
+
+    document.querySelectorAll('[data-action="generate-report"]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        openReportDrawer(this.getAttribute('data-company') || 'Selected Company');
+      });
+    });
+
+    document.querySelectorAll('[data-action="add-to-crm"]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        var companyName = this.getAttribute('data-company') || 'Company';
+        fetch('/api/crm/companies/from-opportunity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ company_name: companyName, company: companyName, source: 'Green Book' })
+        }).then(function (response) {
+          return response.json();
+        }).then(function (data) {
+          if (data && data.company_name) {
+            showCrmSuccess(data.company_name, data);
+          } else {
+            showCrmSuccess(companyName, null);
+          }
+        }).catch(function () {
+          showCrmSuccess(companyName, null);
+        });
+      });
+    });
+
+    continueBrowsing.addEventListener('click', dismissCrmToast);
+    successToast.addEventListener('click', function (event) {
+      if (event.target === successToast) {
+        dismissCrmToast();
+      }
+    });
+
+    closeButton.addEventListener('click', closeReportDrawer);
+
+    drawer.querySelector('.report-drawer__overlay').addEventListener('click', closeReportDrawer);
+
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape' && drawer.classList.contains('is-open')) {
+        closeReportDrawer();
+      }
+    });
+  });
+</script>
+{% endblock %}

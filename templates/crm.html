@@ -1,0 +1,49 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>CRM</h1>
+<p>Central workspace for companies discovered through Regulatory Intelligence and moved into commercial follow-up.</p>
+<section class="panel">
+  <div class="cards">
+    <div>
+      <span>Companies added</span>
+      <strong>{{ companies|length }}</strong>
+    </div>
+    <div>
+      <span>Active opportunities</span>
+      <strong>{{ companies|length }}</strong>
+    </div>
+    <div>
+      <span>Tasks due</span>
+      <strong>0</strong>
+    </div>
+    <div>
+      <span>Meetings scheduled</span>
+      <strong>0</strong>
+    </div>
+    <div>
+      <span>Pipeline value</span>
+      <strong>₦0</strong>
+    </div>
+  </div>
+</section>
+<section>
+  <h2>Tracked companies</h2>
+  {% if companies %}
+  <ul class="crm-company-list">
+    {% for company in companies %}
+    <li class="crm-company-card">
+      <a href="/crm/companies/{{ company.id }}"><strong>{{ company.company_name }}</strong></a>
+      <p>{{ company.portfolio_summary or 'No portfolio summary yet.' }}</p>
+      <div class="crm-company-meta">
+        <span>{{ company.country or 'Unknown' }}</span>
+        <span>Score {{ company.opportunity_score or 0 }}</span>
+        <span>{{ company.opportunity_status or 'New' }}</span>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No companies have been added to CRM yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

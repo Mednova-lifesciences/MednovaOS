@@ -1,0 +1,357 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Outreach Campaign</h1>
+    <p>Create, preview, save, and send outreach emails for this CRM company.</p>
+  </div>
+  <div class="header-actions">
+    <a class="button secondary" href="/crm/companies/{{ company.id }}">Back to company</a>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="compose-header">
+    <div>
+      <h2>Compose email</h2>
+      <p class="section-description">Craft your outreach message, review it, and send it with CRM-style confirmation.</p>
+    </div>
+    <div class="status-pill {% if resendConfigured %}status-ready{% else %}status-blocked{% endif %}">
+      {% if resendConfigured %}Ready to send{% else %}Send blocked{% endif %}
+    </div>
+  </div>
+  {% if warning_message %}
+  <p class="inline-note"><strong>Note:</strong> {{ warning_message }}</p>
+  {% endif %}
+  {% if not resendConfigured %}
+  <p class="inline-note alert-note"><strong>Send email is disabled:</strong> {{ resend_warning_message or 'Resend configuration is incomplete.' }}</p>
+  {% endif %}
+
+  <div id="outreach-feedback" class="feedback-shell" aria-live="polite"></div>
+
+  <form id="outreach-compose-form" class="compose-form" method="post" action="/crm/companies/{{ company.id }}/outreach">
+    <div class="form-grid">
+      <label>
+        Contact
+        <select name="contact_id">
+          {% for contact in contacts %}
+          <option value="{{ contact.id }}" {% if loop.first %}selected{% endif %}>{{ contact.full_name or 'Unnamed contact' }}{% if contact.email %} — {{ contact.email }}{% endif %}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Template
+        <select name="template_key">
+          {% for template in templates %}
+          <option value="{{ template.key }}">{{ template.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Recipient
+        <input type="email" name="recipient" value="{{ recipient or '' }}" />
+      </label>
+      <label>
+        Recipient name
+        <input type="text" name="recipient_name" value="{{ recipient_name or '' }}" />
+      </label>
+      <label>
+        Subject
+        <input type="text" name="subject" value="{{ initial_subject or '' }}" />
+      </label>
+      <label>
+        Sender name
+        <input type="text" name="sender_name" value="{{ sender_name or 'MedNova Lifesciences' }}" />
+      </label>
+      <label>
+        Sender email
+        <input type="text" name="sender_email" value="{{ sender_email or 'info@mednovalife.com' }}" />
+      </label>
+      <label class="full-width">
+        Message body
+        <textarea name="body" rows="10">{{ initial_body or '' }}</textarea>
+      </label>
+    </div>
+    <div class="header-actions compose-actions">
+      <button class="button secondary" type="button" id="preview-button">Preview email</button>
+      <button class="button secondary" type="button" id="save-draft-button">Save draft</button>
+      <button class="button" type="button" id="send-email-button" {% if not resendConfigured %}disabled{% endif %}>Send email</button>
+    </div>
+  </form>
+</section>
+
+{% if preview %}
+<section class="panel">
+  <h2>Preview</h2>
+  <p><strong>Subject:</strong> {{ preview.subject }}</p>
+  <pre>{{ preview.body }}</pre>
+</section>
+{% endif %}
+
+<section class="panel">
+  <div class="compose-header">
+    <div>
+      <h2>Activity Timeline</h2>
+      <p class="section-description">Recent CRM activity and outreach history are updated as soon as an email is sent.</p>
+    </div>
+  </div>
+  <div id="activity-timeline" class="activity-list">
+    {% if history %}
+    {% for item in history %}
+    <article class="activity-item">
+      <div class="activity-dot"></div>
+      <div>
+        <strong>{{ item.subject }}</strong>
+        <p>{{ item.recipient or 'No recipient' }} · {{ item.status|title }} · {{ item.created_at }}</p>
+      </div>
+    </article>
+    {% endfor %}
+    {% else %}
+    <p class="empty-state">No outreach activity yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="compose-header">
+    <div>
+      <h2>Recent outreach</h2>
+      <p class="section-description">The latest sent emails appear here immediately after dispatch.</p>
+    </div>
+  </div>
+  <div id="outreach-history-list" class="history-list">
+    {% if history %}
+    {% for item in history %}
+    <article class="history-card">
+      <div>
+        <strong>{{ item.subject }}</strong>
+        <p>{{ item.recipient or 'No recipient' }}</p>
+      </div>
+      <div>
+        <span class="history-status">{{ item.status|title }}</span>
+        <small>{{ item.created_at }}</small>
+      </div>
+    </article>
+    {% endfor %}
+    {% else %}
+    <p class="empty-state">No outreach history yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<script>
+(function () {
+  const form = document.getElementById('outreach-compose-form');
+  const feedback = document.getElementById('outreach-feedback');
+  const sendButton = document.getElementById('send-email-button');
+  const saveDraftButton = document.getElementById('save-draft-button');
+  const previewButton = document.getElementById('preview-button');
+  const historyList = document.getElementById('outreach-history-list');
+  const activityTimeline = document.getElementById('activity-timeline');
+  const companyId = {{ company.id }};
+
+  function setBusy(isBusy) {
+    const buttons = [sendButton, saveDraftButton, previewButton];
+    buttons.forEach((button) => {
+      if (!button) return;
+      button.disabled = isBusy || button.id === 'send-email-button' && !sendButton.dataset.canSend;
+    });
+    if (sendButton) {
+      sendButton.textContent = isBusy ? 'Sending...' : 'Send email';
+    }
+  }
+
+  function renderFeedback(state) {
+    if (!feedback) return;
+    if (!state) {
+      feedback.innerHTML = '';
+      feedback.className = 'feedback-shell';
+      return;
+    }
+    const title = state.type === 'success' ? 'Email sent successfully' : 'Email could not be sent';
+    const badgeText = state.type === 'success' ? 'Delivered' : 'Needs attention';
+    const accentClass = state.type === 'success' ? 'feedback-card--success' : 'feedback-card--error';
+    const icon = state.type === 'success' ? '✓' : '!' ;
+    feedback.className = `feedback-shell feedback-${state.type}`;
+    feedback.innerHTML = `
+      <div class="feedback-card ${accentClass}">
+        <div class="feedback-icon" aria-hidden="true">${icon}</div>
+        <div class="feedback-content">
+          <div class="feedback-heading">
+            <span class="feedback-badge">${badgeText}</span>
+            <h3>${title}</h3>
+          </div>
+          <p>${state.message}</p>
+          ${state.details ? `<div class="feedback-details">${state.details}</div>` : ''}
+        </div>
+      </div>`;
+  }
+
+  function setCanSend(enabled) {
+    if (!sendButton) return;
+    sendButton.dataset.canSend = enabled ? 'true' : 'false';
+    if (!enabled) {
+      sendButton.disabled = true;
+    } else if (!sendButton.classList.contains('is-busy')) {
+      sendButton.disabled = false;
+    }
+  }
+
+  async function sendEmail() {
+    if (!sendButton || sendButton.dataset.canSend === 'false') return;
+    setBusy(true);
+    sendButton.classList.add('is-busy');
+    renderFeedback(null);
+    const payload = {
+      subject: form.querySelector('input[name="subject"]').value,
+      body: form.querySelector('textarea[name="body"]').value,
+      recipient: form.querySelector('input[name="recipient"]').value,
+      recipient_name: form.querySelector('input[name="recipient_name"]').value,
+      sender_name: form.querySelector('input[name="sender_name"]').value,
+      sender_email: form.querySelector('input[name="sender_email"]').value,
+      template_key: form.querySelector('select[name="template_key"]').value,
+      contact_id: form.querySelector('select[name="contact_id"]').value,
+      template_name: form.querySelector('select[name="template_key"]').selectedOptions[0]?.text || ''
+    };
+
+    try {
+      const response = await fetch(`/api/crm/companies/${companyId}/outreach/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (typeof window !== 'undefined' && window.location.hostname === 'localhost') {
+        console.debug('[outreach]', data);
+      }
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Unable to send the email right now.');
+      }
+      const detailLines = [
+        `<strong>Recipient:</strong> ${payload.recipient_name || payload.recipient || 'Recipient'}`,
+        `<strong>Company:</strong> {{ company.company_name }}`,
+        `<strong>Subject:</strong> ${payload.subject}`,
+        `<strong>Sent from:</strong> ${payload.sender_email || 'info@mednovalife.com'}`
+      ];
+      renderFeedback({
+        type: 'success',
+        message: 'The email was sent successfully.',
+        details: detailLines.join('<br/>')
+      });
+      await refreshOutreach();
+    } catch (error) {
+      renderFeedback({
+        type: 'error',
+        message: error.message || 'Unable to send the email right now.',
+        details: ''
+      });
+    } finally {
+      setBusy(false);
+      sendButton.classList.remove('is-busy');
+    }
+  }
+
+  async function refreshOutreach() {
+    try {
+      const response = await fetch(`/api/crm/companies/${companyId}/outreach/history`);
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        return;
+      }
+      const items = Array.isArray(data.items) ? data.items : [];
+      historyList.innerHTML = items.length ? items.map((item) => `
+        <article class="history-card">
+          <div>
+            <strong>${item.subject || 'Outreach email'}</strong>
+            <p>${item.recipient || 'No recipient'}</p>
+          </div>
+          <div>
+            <span class="history-status">${(item.status || 'sent').toUpperCase()}</span>
+            <small>${item.createdAt || item.created_at || ''}</small>
+          </div>
+        </article>`).join('') : '<p class="empty-state">No outreach history yet.</p>';
+      activityTimeline.innerHTML = items.length ? items.map((item) => `
+        <article class="activity-item">
+          <div class="activity-dot"></div>
+          <div>
+            <strong>${item.subject || 'Outreach email'}</strong>
+            <p>${item.recipient || 'No recipient'} · ${String(item.status || 'sent').toLowerCase()} · ${item.createdAt || item.created_at || ''}</p>
+          </div>
+        </article>`).join('') : '<p class="empty-state">No outreach activity yet.</p>';
+    } catch (error) {
+      console.debug('[outreach-history]', error);
+    }
+  }
+
+  if (sendButton) {
+    sendButton.addEventListener('click', sendEmail);
+  }
+  if (saveDraftButton) {
+    saveDraftButton.addEventListener('click', async () => {
+      const payload = {
+        subject: form.querySelector('input[name="subject"]').value,
+        body: form.querySelector('textarea[name="body"]').value,
+        recipient: form.querySelector('input[name="recipient"]').value,
+        recipient_name: form.querySelector('input[name="recipient_name"]').value,
+        sender_name: form.querySelector('input[name="sender_name"]').value,
+        sender_email: form.querySelector('input[name="sender_email"]').value,
+        template_key: form.querySelector('select[name="template_key"]').value,
+        contact_id: form.querySelector('select[name="contact_id"]').value,
+        template_name: form.querySelector('select[name="template_key"]').selectedOptions[0]?.text || ''
+      };
+      setBusy(true);
+      try {
+        const response = await fetch(`/api/crm/companies/${companyId}/outreach/drafts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+          throw new Error(data.error || 'Unable to save the draft right now.');
+        }
+        renderFeedback({ type: 'success', message: 'Draft saved successfully.', details: '' });
+      } catch (error) {
+        renderFeedback({ type: 'error', message: error.message || 'Unable to save the draft right now.', details: '' });
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+  if (previewButton) {
+    previewButton.addEventListener('click', async () => {
+      const payload = {
+        subject: form.querySelector('input[name="subject"]').value,
+        body: form.querySelector('textarea[name="body"]').value,
+        recipient: form.querySelector('input[name="recipient"]').value,
+        recipient_name: form.querySelector('input[name="recipient_name"]').value,
+        sender_name: form.querySelector('input[name="sender_name"]').value,
+        sender_email: form.querySelector('input[name="sender_email"]').value,
+        template_key: form.querySelector('select[name="template_key"]').value,
+        contact_id: form.querySelector('select[name="contact_id"]').value,
+        template_name: form.querySelector('select[name="template_key"]').selectedOptions[0]?.text || ''
+      };
+      setBusy(true);
+      try {
+        const response = await fetch(`/api/crm/companies/${companyId}/outreach/build`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+          throw new Error(data.error || 'Unable to build the preview right now.');
+        }
+        renderFeedback({ type: 'success', message: 'Preview updated.', details: '' });
+      } catch (error) {
+        renderFeedback({ type: 'error', message: error.message || 'Unable to build the preview right now.', details: '' });
+      } finally {
+        setBusy(false);
+      }
+    });
+  }
+
+  setCanSend({{ 'true' if resendConfigured else 'false' }});
+})();
+</script>
+{% endblock %}

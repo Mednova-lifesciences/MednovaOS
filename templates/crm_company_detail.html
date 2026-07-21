@@ -1,0 +1,119 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>{{ company.company_name }}</h1>
+    <p>CRM company profile populated from Green Book and opportunity data.</p>
+  </div>
+  <div class="header-actions">
+    <a class="button secondary" href="/crm">Back to CRM</a>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="grid">
+    <div>
+      <h3>Company Overview</h3>
+      <p><strong>Country:</strong> {{ company.country or 'Unknown' }}</p>
+      <p><strong>Opportunity score:</strong> {{ company.opportunity_score }}</p>
+      <p><strong>Opportunity status:</strong> {{ company.opportunity_status or 'New' }}</p>
+      <p><strong>Pipeline stage:</strong> {{ company.pipeline_stage or 'Lead' }}</p>
+      <p><strong>Source:</strong> {{ company.source or 'Unknown' }}</p>
+    </div>
+    <div>
+      <h3>Portfolio Summary</h3>
+      <p>{{ company.portfolio_summary or 'No portfolio summary available yet.' }}</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Green Book Products</h2>
+  {% if products %}
+  <table>
+    <thead>
+      <tr>
+        <th>Product</th>
+        <th>Registration Number</th>
+        <th>Dosage Form</th>
+        <th>Therapeutic Area</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for product in products %}
+      <tr>
+        <td>{{ product.product_name or 'Unknown' }}</td>
+        <td>{{ product.registration_number or '—' }}</td>
+        <td>{{ product.dosage_form or '—' }}</td>
+        <td>{{ product.therapeutic_area or '—' }}</td>
+        <td>{{ product.status or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No Green Book product data available.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Registration Details</h2>
+  <p><strong>Registration numbers:</strong> {{ company.registration_numbers or '—' }}</p>
+  <p><strong>Dosage forms:</strong> {{ company.dosage_forms or '—' }}</p>
+  <p><strong>Therapeutic areas:</strong> {{ company.therapeutic_areas or '—' }}</p>
+  <p><strong>Registration dates:</strong> {{ company.registration_dates or '—' }}</p>
+</section>
+
+<section>
+  <h2>Activities</h2>
+  {% if activities %}
+  <ul>
+    {% for activity in activities %}
+    <li><strong>{{ activity.title }}</strong> — {{ activity.body }} ({{ activity.created_at }})</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No activities yet.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Contacts</h2>
+  {% if contacts %}
+  <ul>
+    {% for contact in contacts %}
+    <li><strong>{{ contact.full_name }}</strong> — {{ contact.role }}{% if contact.department %} ({{ contact.department }}){% endif %}{% if contact.email %}; {{ contact.email }}{% endif %}{% if contact.phone %}; {{ contact.phone }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No contacts yet.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Tasks</h2>
+  {% if tasks %}
+  <ul>
+    {% for task in tasks %}
+    <li><strong>{{ task.title }}</strong> — {{ task.status }}{% if task.priority %}; {{ task.priority }}{% endif %}{% if task.due_date %}; due {{ task.due_date }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No tasks yet.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Notes</h2>
+  {% if notes %}
+  <ul>
+    {% for note in notes %}
+    <li>{{ note.body }} ({{ note.created_at }})</li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No notes yet.</p>
+  {% endif %}
+</section>
+{% endblock %}
