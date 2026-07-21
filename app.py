@@ -59,16 +59,16 @@ def _load_environment(env_path: Path | None = None) -> dict:
 
 def _log_startup_diagnostics() -> None:
     env_state = _load_environment()
-    print(f"✓ .env loaded: {env_state['dotenvLoaded']}")
+    print(f"OK .env loaded: {env_state['dotenvLoaded']}")
     if env_state["dotenvLoaded"]:
-        print(f"✓ Resend API key detected: {'yes' if env_state['resendApiKeyConfigured'] else 'no'}")
-        print(f"✓ Sender email configured: {'yes' if env_state['senderEmailConfigured'] else 'no'}")
-        print(f"✓ Sender name configured: {'yes' if env_state['senderNameConfigured'] else 'no'}")
+        print(f"OK Resend API key detected: {'yes' if env_state['resendApiKeyConfigured'] else 'no'}")
+        print(f"OK Sender email configured: {'yes' if env_state['senderEmailConfigured'] else 'no'}")
+        print(f"OK Sender name configured: {'yes' if env_state['senderNameConfigured'] else 'no'}")
     else:
-        print("⚠ .env not loaded")
-        print("⚠ Resend API key detected: no")
-        print("⚠ Sender email configured: no")
-        print("⚠ Sender name configured: no")
+        print("WARNING: .env not loaded")
+        print("WARNING: Resend API key detected: no")
+        print("WARNING: Sender email configured: no")
+        print("WARNING: Sender name configured: no")
 
 
 _log_startup_diagnostics()
@@ -182,24 +182,24 @@ from database.apply_migrations import apply_migrations
 from database.init_db import initialize_database
 
 DEFAULT_DB_PATH = BASE_DIR / "database" / "nafdac_intelligence.db"
-CANDIDATES = [Path.home() / "MedNova-OS" / "database" / "nafdac_intelligence.db", DEFAULT_DB_PATH]
+
+
+def _get_setting_value(name: str, fallback: str | None = None) -> str | None:
+    return (os.getenv(name) or os.getenv("DATABASE_PATH") or fallback or "").strip() or None
 
 
 def db_path() -> Path:
-    configured = os.getenv("MEDNOVA_DB_PATH")
+    configured = _get_setting_value("MEDNOVA_DB_PATH")
     if configured:
         path = Path(configured).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
-    for candidate in CANDIDATES:
-        if candidate.exists():
-            return candidate
     return DEFAULT_DB_PATH
 
 
 def connect() -> sqlite3.Connection:
-    db_file = ensure_database()
-    conn = sqlite3.connect(db_file)
+    db_file = db_path()
+    conn = sqlite3.connect(db_file, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     _ensure_contact_enrichment_columns(conn)
@@ -1855,7 +1855,30 @@ def _build_growhub_related_payloads(conn, companies):
     }
 
 
+def _validate_startup_config() -> None:
+    if os.getenv("MEDNOVA_ENV", "").lower() == "production":
+        if not os.getenv("MEDNOVA_DB_PATH"):
+            raise RuntimeError("MEDNOVA_DB_PATH must be configured in production and point to Railway persistent volume storage.")
+        if not os.getenv("SYNC_CRON_SECRET"):
+            raise RuntimeError("SYNC_CRON_SECRET must be configured in production to protect cron endpoints.")
+
+
+def _validate_existing_database(db_file: Path) -> None:
+    with sqlite3.connect(db_file, timeout=30) as conn:
+        if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products'").fetchone():
+            raise RuntimeError(f"Existing database at {db_file} is missing required base tables.")
+
+        expected_columns = {"nafdac_product_id", "registration_number", "dosage_form_id", "route_id", "category_id"}
+        actual_columns = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
+        if not expected_columns.issubset(actual_columns):
+            raise RuntimeError(
+                f"Existing database at {db_file} does not contain the expected products columns: {sorted(expected_columns)}. "
+                "Do not reinitialize a production database automatically."
+            )
+
+
 def ensure_database() -> Path:
+    _validate_startup_config()
     db_file = db_path()
     db_file.parent.mkdir(parents=True, exist_ok=True)
     if not db_file.exists():
@@ -1863,19 +1886,18 @@ def ensure_database() -> Path:
         apply_migrations(db_file)
         return db_file
 
-    with sqlite3.connect(db_file) as conn:
+    with sqlite3.connect(db_file, timeout=30) as conn:
         products_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products'").fetchone()
         if not products_table:
-            initialize_database(db_file)
-            apply_migrations(db_file)
-            return db_file
+            raise RuntimeError(f"Existing database at {db_file} appears invalid or incomplete.")
 
         expected_columns = {"nafdac_product_id", "registration_number", "dosage_form_id", "route_id", "category_id"}
         actual_columns = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
         if not expected_columns.issubset(actual_columns):
-            initialize_database(db_file)
-            apply_migrations(db_file)
-            return db_file
+            raise RuntimeError(
+                f"Existing database at {db_file} does not contain the expected products columns: {sorted(expected_columns)}. "
+                "Do not reinitialize a production database automatically."
+            )
 
     apply_migrations(db_file)
     return db_file
@@ -2152,8 +2174,19 @@ def _build_opportunity_rows(conn, filters):
 app = Flask(__name__)
 ensure_database()
 ensure_crm_tables()
-scheduler = SyncScheduler(app)
-scheduler.start()
+
+SYNC_SCHEDULER_ENABLED = os.getenv("SYNC_SCHEDULER_ENABLED", "false").strip().lower() == "true"
+if SYNC_SCHEDULER_ENABLED:
+    scheduler = SyncScheduler(app)
+    scheduler.start()
+
+
+def _verify_cron_secret() -> bool:
+    secret = (os.getenv("SYNC_CRON_SECRET") or "").strip()
+    if not secret:
+        return os.getenv("MEDNOVA_ENV", "").strip().lower() != "production"
+    return request.headers.get("X-Cron-Secret", "").strip() == secret
+
 
 ALLOWED_CORS_ORIGINS = {
     "http://localhost:5173",
@@ -3396,6 +3429,48 @@ def admin_cloud_sync_status():
     from backend.cloud.sync_to_supabase import get_last_cloud_sync_summary
 
     return jsonify(get_last_cloud_sync_summary())
+
+
+@app.route("/api/health")
+def health_check():
+    return jsonify({"status": "ok", "database": str(db_path())})
+
+
+@app.route("/health")
+def health_check_alias():
+    return health_check()
+
+
+@app.route("/api/ready")
+def readiness_check():
+    try:
+        db_file = db_path()
+        conn = sqlite3.connect(db_file, timeout=5)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("SELECT 1")
+        conn.close()
+        return jsonify({"status": "ready", "database": str(db_file)})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 503
+
+
+@app.route("/ready")
+def readiness_check_alias():
+    return readiness_check()
+
+
+@app.route("/api/cron/greenbook-sync", methods=["POST", "GET"])
+def cron_greenbook_sync():
+    if not _verify_cron_secret():
+        return jsonify({"success": False, "message": "Invalid or missing cron secret."}), 403
+
+    summary = run_sync(db_path())
+    return jsonify(summary)
+
+
+@app.route("/api/cron/greenbook-sync/status", methods=["GET"])
+def cron_greenbook_sync_status():
+    return admin_sync_status()
 
 
 if __name__ == "__main__":

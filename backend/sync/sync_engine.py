@@ -33,7 +33,7 @@ else:
 from backend.cloud.sync_to_supabase import sync_sqlite_to_supabase
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-DB_PATH = Path(get_setting("DATABASE_PATH") or get_setting("MEDNOVA_DB_PATH") or ROOT_DIR / "database" / "nafdac_intelligence.db")
+DB_PATH = Path(get_setting("MEDNOVA_DB_PATH") or get_setting("DATABASE_PATH") or ROOT_DIR / "database" / "nafdac_intelligence.db")
 
 
 class SyncEngine:

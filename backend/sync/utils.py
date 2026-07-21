@@ -9,13 +9,21 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "sync.log"
-
 
 def get_setting(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
+
+
+def _use_file_logging() -> bool:
+    if os.getenv("MEDNOVA_ENV", "").lower() == "production" or os.getenv("FLASK_ENV", "").lower() == "production":
+        return False
+
+    explicit = (get_setting("LOG_TO_FILE") or "").strip().lower()
+    if explicit:
+        return explicit in {"1", "true", "yes", "y"}
+
+    env = os.getenv("MEDNOVA_ENV", "").lower() or os.getenv("FLASK_ENV", "").lower()
+    return env != "production"
 
 
 def configure_logging() -> logging.Logger:
@@ -24,7 +32,14 @@ def configure_logging() -> logging.Logger:
         return logger
 
     logger.setLevel(logging.INFO)
-    handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    if _use_file_logging():
+        log_dir = Path(get_setting("LOG_DIR") or Path(__file__).resolve().parents[2] / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "sync.log"
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+    else:
+        handler = logging.StreamHandler()
+
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.propagate = False

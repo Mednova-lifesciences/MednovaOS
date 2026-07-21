@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,14 +12,28 @@ from .supabase_client import get_supabase
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 LOG_DIR = ROOT_DIR / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_PATH = LOG_DIR / "cloud_sync.log"
 _LAST_CLOUD_SYNC_SUMMARY: dict[str, Any] = {}
+
+
+def _use_file_logging() -> bool:
+    if os.getenv("MEDNOVA_ENV", "").lower() == "production" or os.getenv("FLASK_ENV", "").lower() == "production":
+        return False
+
+    explicit = (os.getenv("LOG_TO_FILE") or "").strip().lower()
+    if explicit:
+        return explicit in {"1", "true", "yes", "y"}
+    env = os.getenv("MEDNOVA_ENV", "").lower() or os.getenv("FLASK_ENV", "").lower()
+    return env != "production"
 
 logger = logging.getLogger("cloud_sync")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
-    handler = logging.FileHandler(LOG_PATH)
+    if _use_file_logging():
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(LOG_PATH)
+    else:
+        handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 
@@ -29,8 +44,11 @@ class SupabaseSyncError(RuntimeError):
 
 def _connect_sqlite(db_path: str | Path | None = None) -> sqlite3.Connection:
     default_db = ROOT_DIR / "database" / "nafdac_intelligence.db"
-    path = Path(db_path or default_db)
-    conn = sqlite3.connect(path)
+    configured = db_path or os.getenv("MEDNOVA_DB_PATH") or os.getenv("DATABASE_PATH")
+    path = Path(configured) if configured else default_db
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
