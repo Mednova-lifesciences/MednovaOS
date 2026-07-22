@@ -18,6 +18,7 @@ from flask import Flask, abort, jsonify, redirect, render_template, render_templ
 
 from backend.cloud.sync_to_supabase import sync_sqlite_to_supabase
 from backend.services.crm_service import add_activity, add_note, complete_task, create_company_from_payload, create_contact, create_task
+from backend.database.repositories import companies as companies_repo
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATHS = [BASE_DIR / ".env", Path.cwd() / ".env"]
@@ -2480,52 +2481,68 @@ def growhub_crm_data():
 
 @app.route("/api/crm/companies/<int:company_id>")
 def crm_company_detail_json(company_id):
-    conn = connect()
-    try:
-        company = conn.execute("SELECT * FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    # If MEDNOVA_DB_PATH is configured (tests / legacy), keep sqlite behavior
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
+        try:
+            company = conn.execute("SELECT * FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            if not company:
+                abort(404)
 
-        products = json.loads(company["greenbook_products_json"] or "[]") if company["greenbook_products_json"] else []
-        activities = [
-            _row_to_dict(row)
-            for row in conn.execute(
-                "SELECT activity_type, title, body, created_at FROM crm_activities WHERE crm_company_id = ? ORDER BY created_at DESC",
-                (company_id,),
-            ).fetchall()
-        ]
-        notes = [
-            _row_to_dict(row)
-            for row in conn.execute(
-                "SELECT id, body, created_at FROM crm_notes WHERE crm_company_id = ? ORDER BY created_at DESC",
-                (company_id,),
-            ).fetchall()
-        ]
-        contacts = [
-            _row_to_dict(row)
-            for row in conn.execute(
-                "SELECT id, full_name, role, department, email, phone, source, created_at, source_url, discovered_at, confidence_score, verification_status, website, linkedin_url, notes FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC",
-                (company_id,),
-            ).fetchall()
-        ]
-        tasks = [
-            _row_to_dict(row)
-            for row in conn.execute(
-                "SELECT id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE crm_company_id = ? ORDER BY due_date IS NULL, due_date, created_at DESC",
-                (company_id,),
-            ).fetchall()
-        ]
+            products = json.loads(company["greenbook_products_json"] or "[]") if company["greenbook_products_json"] else []
+            activities = [
+                _row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT activity_type, title, body, created_at FROM crm_activities WHERE crm_company_id = ? ORDER BY created_at DESC",
+                    (company_id,),
+                ).fetchall()
+            ]
+            notes = [
+                _row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT id, body, created_at FROM crm_notes WHERE crm_company_id = ? ORDER BY created_at DESC",
+                    (company_id,),
+                ).fetchall()
+            ]
+            contacts = [
+                _row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT id, full_name, role, department, email, phone, source, created_at, source_url, discovered_at, confidence_score, verification_status, website, linkedin_url, notes FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC",
+                    (company_id,),
+                ).fetchall()
+            ]
+            tasks = [
+                _row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE crm_company_id = ? ORDER BY due_date IS NULL, due_date, created_at DESC",
+                    (company_id,),
+                ).fetchall()
+            ]
 
-        return jsonify({
-            "company": _row_to_dict(company),
-            "products": products,
-            "activities": activities,
-            "notes": notes,
-            "contacts": contacts,
-            "tasks": tasks,
-        })
-    finally:
-        conn.close()
+            return jsonify({
+                "company": _row_to_dict(company),
+                "products": products,
+                "activities": activities,
+                "notes": notes,
+                "contacts": contacts,
+                "tasks": tasks,
+            })
+        finally:
+            conn.close()
+
+    # Otherwise use Supabase repository (production / Render)
+    detail = companies_repo.get_company_detail(company_id)
+    if not detail:
+        abort(404)
+    # repo returns company as dict and lists of dicts; return similar JSON structure
+    return jsonify({
+        "company": detail["company"],
+        "products": detail.get("products") or [],
+        "activities": detail.get("activities") or [],
+        "notes": detail.get("notes") or [],
+        "contacts": detail.get("contacts") or [],
+        "tasks": detail.get("tasks") or [],
+    })
 
 
 @app.route("/crm/companies/<int:company_id>")
@@ -2632,71 +2649,87 @@ def update_company_pipeline_stage(company_id):
         return jsonify({"error": "pipelineStage is required"}), 400
 
     stage = _crm_deal_stage_to_frontend(stage_value)
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    # Legacy sqlite path
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
+        try:
+            company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            if not company:
+                abort(404)
 
-        conn.execute("UPDATE crm_companies SET pipeline_stage = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (stage.title(), company_id))
-        add_activity(conn, company_id, "company", "Pipeline stage updated", f"Updated pipeline stage for {company['company_name']} to {stage.title()}")
-        conn.commit()
-        row = conn.execute("SELECT id, company_name, pipeline_stage FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        return jsonify({"success": True, "company": _row_to_dict(row)})
-    finally:
-        conn.close()
+            conn.execute("UPDATE crm_companies SET pipeline_stage = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (stage.title(), company_id))
+            add_activity(conn, company_id, "company", "Pipeline stage updated", f"Updated pipeline stage for {company['company_name']} to {stage.title()}")
+            conn.commit()
+            row = conn.execute("SELECT id, company_name, pipeline_stage FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            return jsonify({"success": True, "company": _row_to_dict(row)})
+        finally:
+            conn.close()
+
+    # Supabase path
+    company = companies_repo.get_company(company_id)
+    if not company:
+        abort(404)
+    companies_repo.db.update("crm_companies", company_id, {"pipeline_stage": stage.title(), "updated_at": datetime.now(timezone.utc).isoformat()})
+    companies_repo.add_activity(company_id, "company", "Pipeline stage updated", f"Updated pipeline stage for {company.get('company_name')} to {stage.title()}")
+    updated = companies_repo.get_company(company_id)
+    return jsonify({"success": True, "company": updated})
 
 
 @app.route("/api/crm/companies/<int:company_id>/contacts/discover", methods=["POST"])
 def discover_company_contacts(company_id):
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
-
-        add_activity(conn, company_id, "contact", "Contact discovery started", f"Started public contact discovery for {company['company_name']}")
-        conn.commit()
-
+    # For discovery we rely on existing sqlite workflow for now (complex network operations)
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
         try:
-            profiles, imported_count, updated_count, duplicates_skipped = _discover_contacts_for_company(conn, company_id, company["company_name"])
-        except Exception as exc:
-            message = str(exc).strip() or "The public discovery provider rejected the request."
-            lowered_message = message.lower()
-            if (
-                "nameresolutionerror" in lowered_message
-                or "getaddrinfo" in lowered_message
-                or "failed to resolve" in lowered_message
-                or "max retries exceeded" in lowered_message
-                or "timed out" in lowered_message
-                or "timeout" in lowered_message
-                or "readtimeout" in lowered_message
-                or "connecttimeout" in lowered_message
-            ):
-                message = "The public discovery service could not be reached from this environment."
-            add_activity(conn, company_id, "contact", "Enrichment failed", f"Contact discovery failed for {company['company_name']}: {message}")
+            company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            if not company:
+                abort(404)
+
+            add_activity(conn, company_id, "contact", "Contact discovery started", f"Started public contact discovery for {company['company_name']}")
             conn.commit()
-            return jsonify({"success": False, "error": f"Contact discovery failed: {message}"}), 502
 
-        if imported_count:
-            add_activity(conn, company_id, "contact", "Contacts imported", f"Imported {imported_count} discovered contacts for {company['company_name']}")
-        if updated_count:
-            add_activity(conn, company_id, "contact", "Contacts updated", f"Updated {updated_count} discovered contacts for {company['company_name']}")
-        if duplicates_skipped:
-            add_activity(conn, company_id, "contact", "Duplicates skipped", f"Skipped {duplicates_skipped} duplicate contacts for {company['company_name']}")
-        add_activity(conn, company_id, "contact", "Enrichment completed", f"Completed contact discovery for {company['company_name']}")
-        conn.commit()
+            try:
+                profiles, imported_count, updated_count, duplicates_skipped = _discover_contacts_for_company(conn, company_id, company["company_name"])
+            except Exception as exc:
+                message = str(exc).strip() or "The public discovery provider rejected the request."
+                lowered_message = message.lower()
+                if (
+                    "nameresolutionerror" in lowered_message
+                    or "getaddrinfo" in lowered_message
+                    or "failed to resolve" in lowered_message
+                    or "max retries exceeded" in lowered_message
+                    or "timed out" in lowered_message
+                    or "timeout" in lowered_message
+                    or "readtimeout" in lowered_message
+                    or "connecttimeout" in lowered_message
+                ):
+                    message = "The public discovery service could not be reached from this environment."
+                add_activity(conn, company_id, "contact", "Enrichment failed", f"Contact discovery failed for {company['company_name']}: {message}")
+                conn.commit()
+                return jsonify({"success": False, "error": f"Contact discovery failed: {message}"}), 502
 
-        return jsonify({
-            "success": True,
-            "company_id": company_id,
-            "profiles_found": len(profiles),
-            "imported_count": imported_count,
-            "updated_count": updated_count,
-            "duplicates_skipped": duplicates_skipped,
-        })
-    finally:
-        conn.close()
+            if imported_count:
+                add_activity(conn, company_id, "contact", "Contacts imported", f"Imported {imported_count} discovered contacts for {company['company_name']}")
+            if updated_count:
+                add_activity(conn, company_id, "contact", "Contacts updated", f"Updated {updated_count} discovered contacts for {company['company_name']}")
+            if duplicates_skipped:
+                add_activity(conn, company_id, "contact", "Duplicates skipped", f"Skipped {duplicates_skipped} duplicate contacts for {company['company_name']}")
+            add_activity(conn, company_id, "contact", "Enrichment completed", f"Completed contact discovery for {company['company_name']}")
+            conn.commit()
+
+            return jsonify({
+                "success": True,
+                "company_id": company_id,
+                "profiles_found": len(profiles),
+                "imported_count": imported_count,
+                "updated_count": updated_count,
+                "duplicates_skipped": duplicates_skipped,
+            })
+        finally:
+            conn.close()
+
+    # If running against Supabase, discovery is not supported in Phase 1
+    return jsonify({"success": False, "error": "Contact discovery is not supported in Supabase mode yet"}), 501
 
 
 @app.route("/api/outreach/status")
@@ -2983,19 +3016,30 @@ def add_company_contact(company_id):
     if not full_name:
         return jsonify({"error": "full_name is required"}), 400
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    # Legacy sqlite
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
+        try:
+            company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            if not company:
+                abort(404)
 
-        contact_id = create_contact(conn, company_id, payload)
-        add_activity(conn, company_id, "contact", "Contact added", f"Added contact {full_name}")
-        conn.commit()
-        contact = conn.execute("SELECT id, crm_company_id, full_name, role, department, email, phone, source, created_at FROM crm_contacts WHERE id = ?", (contact_id,)).fetchone()
-        return jsonify({"success": True, "contact": _row_to_dict(contact)})
-    finally:
-        conn.close()
+            contact_id = create_contact(conn, company_id, payload)
+            add_activity(conn, company_id, "contact", "Contact added", f"Added contact {full_name}")
+            conn.commit()
+            contact = conn.execute("SELECT id, crm_company_id, full_name, role, department, email, phone, source, created_at FROM crm_contacts WHERE id = ?", (contact_id,)).fetchone()
+            return jsonify({"success": True, "contact": _row_to_dict(contact)})
+        finally:
+            conn.close()
+
+    # Supabase path
+    company = companies_repo.get_company(company_id)
+    if not company:
+        abort(404)
+    new_id = companies_repo.create_contact(company_id, payload)
+    companies_repo.add_activity(company_id, "contact", "Contact added", f"Added contact {full_name}")
+    contact = companies_repo.db.get_by_id("crm_contacts", new_id)
+    return jsonify({"success": True, "contact": contact})
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks", methods=["POST"])
@@ -3005,19 +3049,28 @@ def add_company_task(company_id):
     if not title:
         return jsonify({"error": "title is required"}), 400
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
+        try:
+            company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            if not company:
+                abort(404)
 
-        task_id = create_task(conn, company_id, payload)
-        add_activity(conn, company_id, "task", "Task assigned", f"Assigned task {title}")
-        conn.commit()
-        task = conn.execute("SELECT id, crm_company_id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE id = ?", (task_id,)).fetchone()
-        return jsonify({"success": True, "task": _row_to_dict(task)})
-    finally:
-        conn.close()
+            task_id = create_task(conn, company_id, payload)
+            add_activity(conn, company_id, "task", "Task assigned", f"Assigned task {title}")
+            conn.commit()
+            task = conn.execute("SELECT id, crm_company_id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE id = ?", (task_id,)).fetchone()
+            return jsonify({"success": True, "task": _row_to_dict(task)})
+        finally:
+            conn.close()
+
+    company = companies_repo.get_company(company_id)
+    if not company:
+        abort(404)
+    new_id = companies_repo.create_task(company_id, payload)
+    companies_repo.add_activity(company_id, "task", "Task assigned", f"Assigned task {title}")
+    task = companies_repo.db.get_by_id("crm_tasks", new_id)
+    return jsonify({"success": True, "task": task})
 
 
 @app.route("/api/crm/companies/<int:company_id>/notes", methods=["POST"])
@@ -3027,36 +3080,54 @@ def add_company_note(company_id):
     if not body:
         return jsonify({"error": "body is required"}), 400
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
+        try:
+            company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+            if not company:
+                abort(404)
 
-        note_id = add_note(conn, company_id, body)
-        add_activity(conn, company_id, "note", "Note created", body)
-        conn.commit()
-        note = conn.execute("SELECT id, crm_company_id, body, created_at FROM crm_notes WHERE id = ?", (note_id,)).fetchone()
-        return jsonify({"success": True, "note": _row_to_dict(note)})
-    finally:
-        conn.close()
+            note_id = add_note(conn, company_id, body)
+            add_activity(conn, company_id, "note", "Note created", body)
+            conn.commit()
+            note = conn.execute("SELECT id, crm_company_id, body, created_at FROM crm_notes WHERE id = ?", (note_id,)).fetchone()
+            return jsonify({"success": True, "note": _row_to_dict(note)})
+        finally:
+            conn.close()
+
+    company = companies_repo.get_company(company_id)
+    if not company:
+        abort(404)
+    new_id = companies_repo.add_note(company_id, body)
+    companies_repo.add_activity(company_id, "note", "Note created", body)
+    note = companies_repo.db.get_by_id("crm_notes", new_id)
+    return jsonify({"success": True, "note": note})
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks/<int:task_id>/complete", methods=["POST"])
 def complete_company_task(company_id, task_id):
-    conn = connect()
     try:
-        company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+        if os.getenv("MEDNOVA_DB_PATH"):
+            conn = connect()
+            try:
+                company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+                if not company:
+                    abort(404)
+
+                task = complete_task(conn, company_id, task_id)
+                conn.commit()
+                return jsonify({"success": True, "task": _row_to_dict(task)})
+            finally:
+                conn.close()
+
+        # Supabase path
+        company = companies_repo.get_company(company_id)
         if not company:
             abort(404)
-
-        task = complete_task(conn, company_id, task_id)
-        conn.commit()
-        return jsonify({"success": True, "task": _row_to_dict(task)})
+        task = companies_repo.complete_task(company_id, task_id)
+        return jsonify({"success": True, "task": task})
     except LookupError:
         return jsonify({"error": "task not found"}), 404
-    finally:
-        conn.close()
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks/<int:task_id>", methods=["PATCH"])
@@ -3362,26 +3433,40 @@ def add_company_to_crm():
     company_name = (payload.get("company_name") or payload.get("company") or "").strip()
     if not company_name:
         return jsonify({"error": "company_name is required"}), 400
+    # Legacy sqlite path
+    if os.getenv("MEDNOVA_DB_PATH"):
+        conn = connect()
+        try:
+            company_id, company_data, created = _upsert_crm_company(conn, company_name, payload)
+            company_row = conn.execute(
+                "SELECT id, company_name, country, opportunity_score, portfolio_summary, opportunity_status, pipeline_stage, created_at FROM crm_companies WHERE id = ?",
+                (company_id,),
+            ).fetchone()
+            return jsonify({
+                "success": True,
+                "company_id": company_id,
+                "company_name": company_row["company_name"] if company_row else company_data["company_name"],
+                "created": created,
+                "exists": not created,
+                "message": "Company added successfully" if created else "This company already exists in your CRM.",
+                "status": "created" if created else "exists",
+                "company": dict(company_row) if company_row else None,
+            })
+        finally:
+            conn.close()
 
-    conn = connect()
-    try:
-        company_id, company_data, created = _upsert_crm_company(conn, company_name, payload)
-        company_row = conn.execute(
-            "SELECT id, company_name, country, opportunity_score, portfolio_summary, opportunity_status, pipeline_stage, created_at FROM crm_companies WHERE id = ?",
-            (company_id,),
-        ).fetchone()
-        return jsonify({
-            "success": True,
-            "company_id": company_id,
-            "company_name": company_row["company_name"] if company_row else company_data["company_name"],
-            "created": created,
-            "exists": not created,
-            "message": "Company added successfully" if created else "This company already exists in your CRM.",
-            "status": "created" if created else "exists",
-            "company": dict(company_row) if company_row else None,
-        })
-    finally:
-        conn.close()
+    # Supabase path
+    company_id, company_row, created = companies_repo.create_company_from_payload(payload)
+    return jsonify({
+        "success": True,
+        "company_id": company_id,
+        "company_name": company_row.get("company_name") if company_row else payload.get("company_name"),
+        "created": created,
+        "exists": not created,
+        "message": "Company added successfully" if created else "This company already exists in your CRM.",
+        "status": "created" if created else "exists",
+        "company": company_row,
+    })
 
 
 @app.route("/admin/sync", methods=["POST"])
