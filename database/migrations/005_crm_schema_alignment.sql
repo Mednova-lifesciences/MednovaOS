@@ -120,7 +120,52 @@ CREATE TABLE IF NOT EXISTS crm_outreach_emails (
     FOREIGN KEY (crm_contact_id) REFERENCES crm_contacts(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS crm_company_intelligence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    crm_company_id INTEGER NOT NULL,
+    data TEXT,
+    search_results_json TEXT,
+    search_date TEXT,
+    search_status TEXT,
+    last_refresh TEXT,
+    source_summary TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS crm_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    crm_company_id INTEGER NOT NULL,
+    report_type TEXT,
+    report_name TEXT,
+    report_data TEXT,
+    executive_summary TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS tavily_search_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    search_query TEXT NOT NULL,
+    search_results_json TEXT,
+    search_date TEXT,
+    last_refreshed_at TEXT,
+    ttl_days INTEGER DEFAULT 7,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_crm_contacts_company_id ON crm_contacts(crm_company_id);
+CREATE INDEX IF NOT EXISTS idx_crm_company_intelligence_company_id ON crm_company_intelligence(crm_company_id);
+CREATE INDEX IF NOT EXISTS idx_crm_company_intelligence_status ON crm_company_intelligence(search_status);
+CREATE INDEX IF NOT EXISTS idx_crm_company_intelligence_created ON crm_company_intelligence(created_at);
+CREATE INDEX IF NOT EXISTS idx_tavily_search_cache_company_id ON tavily_search_cache(company_id);
+CREATE INDEX IF NOT EXISTS idx_tavily_search_cache_query ON tavily_search_cache(search_query);
+CREATE INDEX IF NOT EXISTS idx_tavily_search_cache_refreshed ON tavily_search_cache(last_refreshed_at);
 CREATE INDEX IF NOT EXISTS idx_crm_tasks_company_id ON crm_tasks(crm_company_id);
 CREATE INDEX IF NOT EXISTS idx_crm_tasks_status ON crm_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_crm_tasks_due_date ON crm_tasks(due_date);

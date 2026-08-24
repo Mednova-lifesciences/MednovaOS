@@ -1,20 +1,43 @@
 {% extends 'base.html' %}
 {% block content %}
 <h1>Revenue Opportunities</h1>
+{% if error_message %}
+<p class="error">{{ error_message }}</p>
+{% endif %}
 <section>
+  <div class="opportunity-kpis">
+    <div class="summary-card"><span>Total Opportunities</span><strong>{{ summary.total_opportunities }}</strong></div>
+    <div class="summary-card"><span>High Priority</span><strong>{{ summary.high_priority }}</strong></div>
+    <div class="summary-card"><span>Closing Soon</span><strong>{{ summary.closing_soon }}</strong></div>
+    <div class="summary-card"><span>Total Pipeline Value</span><strong>{{ summary.total_pipeline_value|money }}</strong></div>
+    <div class="summary-card"><span>Average Opportunity Value</span><strong>{{ summary.average_opportunity_value|money }}</strong></div>
+  </div>
+
   <form class="opportunity-filters" method="get">
-    <input type="search" name="q" value="{{ q }}" placeholder="Search company" />
-    <select name="product_category">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search company, manufacturer, product, category, service" />
+    <select name="category">
       <option value="">All categories</option>
-      {% for category in categories %}
-      <option value="{{ category.category_name }}" {% if product_category == category.category_name %}selected{% endif %}>{{ category.category_name }}</option>
+      {% for category_option in categories %}
+      <option value="{{ category_option }}" {% if category == category_option %}selected{% endif %}>{{ category_option }}</option>
       {% endfor %}
     </select>
-    <select name="registration_status">
+    <select name="status">
       <option value="">All statuses</option>
-      {% for status in statuses %}
-      <option value="{{ status.status }}" {% if registration_status == status.status %}selected{% endif %}>{{ status.status }}</option>
+      {% for status_option in statuses %}
+      <option value="{{ status_option }}" {% if status == status_option %}selected{% endif %}>{{ status_option }}</option>
       {% endfor %}
+    </select>
+    <select name="priority">
+      <option value="">Any priority</option>
+      <option value="high" {% if priority == 'high' %}selected{% endif %}>High</option>
+      <option value="medium" {% if priority == 'medium' %}selected{% endif %}>Medium</option>
+      <option value="low" {% if priority == 'low' %}selected{% endif %}>Low</option>
+    </select>
+    <select name="probability">
+      <option value="">Any probability</option>
+      <option value="high" {% if probability == 'high' %}selected{% endif %}>High</option>
+      <option value="medium" {% if probability == 'medium' %}selected{% endif %}>Medium</option>
+      <option value="low" {% if probability == 'low' %}selected{% endif %}>Low</option>
     </select>
     <select name="estimated_value">
       <option value="">Any value</option>
@@ -22,61 +45,95 @@
       <option value="5m_10m" {% if estimated_value == '5m_10m' %}selected{% endif %}>₦5M–₦10M</option>
       <option value="gt_10m" {% if estimated_value == 'gt_10m' %}selected{% endif %}>Over ₦10M</option>
     </select>
+    <select name="service">
+      <option value="">Any service</option>
+      {% for service_option in services %}
+      <option value="{{ service_option }}" {% if service == service_option %}selected{% endif %}>{{ service_option }}</option>
+      {% endfor %}
+    </select>
+    <select name="manufacturer">
+      <option value="">Any manufacturer</option>
+      {% for manufacturer_option in manufacturers %}
+      <option value="{{ manufacturer_option }}" {% if manufacturer == manufacturer_option %}selected{% endif %}>{{ manufacturer_option }}</option>
+      {% endfor %}
+    </select>
     <select name="sort_by">
-      <option value="score" {% if sort_by == 'score' %}selected{% endif %}>Score</option>
+      <option value="newest" {% if sort_by == 'newest' %}selected{% endif %}>Newest</option>
+      <option value="oldest" {% if sort_by == 'oldest' %}selected{% endif %}>Oldest</option>
+      <option value="estimated_value" {% if sort_by == 'estimated_value' %}selected{% endif %}>Estimated Value</option>
+      <option value="probability" {% if sort_by == 'probability' %}selected{% endif %}>Probability</option>
       <option value="company" {% if sort_by == 'company' %}selected{% endif %}>Company</option>
-      <option value="products" {% if sort_by == 'products' %}selected{% endif %}>Products</option>
     </select>
     <button type="submit">Apply</button>
     <a class="button secondary" href="/opportunities">Reset</a>
   </form>
 
+  <div class="pagination">
+    {% if page > 1 %}
+    <a class="button secondary" href="/opportunities?page={{ page - 1 }}&page_size={{ page_size }}{% if q %}&q={{ q }}{% endif %}{% if category %}&category={{ category }}{% endif %}{% if status %}&status={{ status }}{% endif %}{% if priority %}&priority={{ priority }}{% endif %}{% if probability %}&probability={{ probability }}{% endif %}{% if service %}&service={{ service }}{% endif %}{% if manufacturer %}&manufacturer={{ manufacturer }}{% endif %}{% if sort_by %}&sort_by={{ sort_by }}{% endif %}">Previous</a>
+    {% endif %}
+    <span>Page {{ page }} of {{ total // page_size + (1 if total % page_size else 0) or 1 }}</span>
+    {% if rows|length == page_size %}
+    <a class="button secondary" href="/opportunities?page={{ page + 1 }}&page_size={{ page_size }}{% if q %}&q={{ q }}{% endif %}{% if category %}&category={{ category }}{% endif %}{% if status %}&status={{ status }}{% endif %}{% if priority %}&priority={{ priority }}{% endif %}{% if probability %}&probability={{ probability }}{% endif %}{% if service %}&service={{ service }}{% endif %}{% if manufacturer %}&manufacturer={{ manufacturer }}{% endif %}{% if sort_by %}&sort_by={{ sort_by }}{% endif %}">Next</a>
+    {% endif %}
+  </div>
+
   <table>
     <tr>
+      <th>Opportunity ID</th>
       <th>Company</th>
+      <th>Manufacturer</th>
+      <th>Product</th>
       <th>Category</th>
-      <th>Products</th>
-      <th>Estimated value</th>
-      <th>Services</th>
+      <th>Service Type</th>
+      <th>Estimated Value</th>
+      <th>Probability</th>
+      <th>Priority</th>
+      <th>Expiry Date</th>
       <th>Status</th>
+      <th>Recommendation</th>
+      <th>Created At</th>
     </tr>
     {% for r in rows %}
     <tr class="company-summary-row">
+      <td>{{ r.opportunity_id }}</td>
       <td>
         <div class="company-cell">
-          <span>{{ r.company }}</span>
+          <span>{{ r.company_name }}</span>
           <button type="button" class="inline-toggle" data-target="details-{{ loop.index }}">View</button>
         </div>
       </td>
-      <td>{{ r.therapeutic_areas|join(', ') }}</td>
-      <td>{{ r.product_count }}</td>
+      <td>{{ r.manufacturer_name or '—' }}</td>
+      <td>{{ r.product_name or '—' }}</td>
+      <td>{{ r.category or '—' }}</td>
+      <td>{{ r.service_type or '—' }}</td>
       <td>{{ r.estimated_value|money }}</td>
-      <td>{{ r.recommended_services|join(', ') }}</td>
-      <td>{{ r.status }}</td>
+      <td>{{ r.probability }}%</td>
+      <td>{{ r.priority|title }}</td>
+      <td>{{ r.expiry_date|format_date or '—' }}</td>
+      <td>{{ r.opportunity_status }}</td>
+      <td>{{ r.recommendation or '—' }}</td>
+      <td>{{ r.created_at or '—' }}</td>
     </tr>
     <tr class="details-row" id="details-{{ loop.index }}" hidden>
-      <td colspan="6">
+      <td colspan="13">
         <div class="detail-card">
           <div class="detail-section">
-            <strong>Registered Products</strong>
+            <strong>Opportunity Details</strong>
             <table class="products-table">
               <thead>
                 <tr>
-                  <th>Product</th>
-                  <th>Strength</th>
-                  <th>Dosage form</th>
-                  <th>Category</th>
+                  <th>Field</th>
+                  <th>Value</th>
                 </tr>
               </thead>
               <tbody>
-                {% for product in r.products %}
-                <tr>
-                  <td>{{ product.product_name }}</td>
-                  <td>{{ product.strength or '—' }}</td>
-                  <td>{{ product.dosage_form or 'Unknown form' }}</td>
-                  <td>{{ product.category_name or 'Unknown category' }}</td>
-                </tr>
-                {% endfor %}
+                <tr><td>Manufacturer</td><td>{{ r.manufacturer_name or '—' }}</td></tr>
+                <tr><td>Product</td><td>{{ r.product_name or '—' }}</td></tr>
+                <tr><td>Service Type</td><td>{{ r.service_type or '—' }}</td></tr>
+                <tr><td>Estimated Value</td><td>{{ r.estimated_value|money }}</td></tr>
+                <tr><td>Probability</td><td>{{ r.probability }}%</td></tr>
+                <tr><td>Priority</td><td>{{ r.priority|title }}</td></tr>
               </tbody>
             </table>
           </div>
@@ -86,12 +143,12 @@
               <div class="commercial-card">
                 <h4>Generate Report</h4>
                 <p>Summarize regulatory momentum and market opportunity.</p>
-                <button type="button" data-action="generate-report" data-company="{{ r.company }}">Generate Report</button>
+                <button type="button" data-action="generate-report" data-company="{{ r.company_name }}">Generate Report</button>
               </div>
               <div class="commercial-card">
                 <h4>Add Opportunity to CRM</h4>
                 <p>Queue this company into the CRM workflow.</p>
-                <button type="button" data-action="add-to-crm" data-company="{{ r.company }}">Add Opportunity to CRM</button>
+                <button type="button" data-action="add-to-crm" data-company="{{ r.company_name }}">Add Opportunity to CRM</button>
               </div>
             </div>
           </div>

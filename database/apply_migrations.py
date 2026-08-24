@@ -171,9 +171,78 @@ def _apply_crm_schema_alignment_migration(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crm_company_intelligence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crm_company_id INTEGER NOT NULL,
+            data TEXT,
+            search_results_json TEXT,
+            search_date TEXT,
+            search_status TEXT,
+            last_refresh TEXT,
+            source_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_company_intelligence_company_id ON crm_company_intelligence(crm_company_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crm_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crm_company_id INTEGER NOT NULL,
+            report_type TEXT,
+            report_name TEXT,
+            report_data TEXT,
+            executive_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tavily_search_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            search_query TEXT NOT NULL,
+            search_results_json TEXT,
+            search_date TEXT,
+            last_refreshed_at TEXT,
+            ttl_days INTEGER DEFAULT 7,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tavily_search_cache_company_id ON tavily_search_cache(company_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tavily_search_cache_query ON tavily_search_cache(search_query)
+        """
+    )
 
     _ensure_column(conn, "crm_companies", "opportunity_status", "TEXT DEFAULT 'New'")
     _ensure_column(conn, "crm_companies", "pipeline_stage", "TEXT DEFAULT 'Lead'")
+    _ensure_column(conn, "crm_company_intelligence", "created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(conn, "crm_company_intelligence", "updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(conn, "crm_reports", "created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(conn, "crm_reports", "updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(conn, "tavily_search_cache", "created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(conn, "tavily_search_cache", "updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
     _ensure_column(conn, "crm_contacts", "source_url", "TEXT")
     _ensure_column(conn, "crm_contacts", "discovered_at", "TEXT")
     _ensure_column(conn, "crm_contacts", "confidence_score", "REAL")
@@ -218,14 +287,36 @@ def apply_migrations(db_path: str | Path | None = None) -> None:
     conn.execute("PRAGMA journal_mode = WAL")
     try:
         _ensure_schema_migrations_table(conn)
+        applied_names = {row[0] for row in conn.execute("SELECT name FROM schema_migrations").fetchall()}
         for migration_path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            applied = conn.execute("SELECT 1 FROM schema_migrations WHERE name = ?", (migration_path.name,)).fetchone()
-            if applied:
+            if migration_path.name in applied_names:
                 continue
-            if migration_path.name == "005_crm_schema_alignment.sql":
-                _apply_crm_schema_alignment_migration(conn)
-            else:
-                conn.executescript(migration_path.read_text(encoding="utf-8"))
+            try:
+                if migration_path.name == "005_crm_schema_alignment.sql":
+                    _apply_crm_schema_alignment_migration(conn)
+                else:
+                    conn.executescript(migration_path.read_text(encoding="utf-8"))
+            except sqlite3.OperationalError as exc:
+                if "no such column: created_at" in str(exc).lower():
+                    # Older databases may already have the target tables, but lack the timestamp columns.
+                    # Make the migration robust by adding missing columns and continuing.
+                    for table_name, column_name, column_def in [
+                        ("crm_company_intelligence", "created_at", "TEXT"),
+                        ("crm_company_intelligence", "updated_at", "TEXT"),
+                        ("crm_reports", "created_at", "TEXT"),
+                        ("crm_reports", "updated_at", "TEXT"),
+                        ("tavily_search_cache", "created_at", "TEXT"),
+                        ("tavily_search_cache", "updated_at", "TEXT"),
+                    ]:
+                        try:
+                            _ensure_column(conn, table_name, column_name, column_def)
+                        except sqlite3.OperationalError as table_exc:
+                            if "no such table" in str(table_exc).lower():
+                                continue
+                            raise
+                    conn.commit()
+                else:
+                    raise
             conn.execute("INSERT INTO schema_migrations (name) VALUES (?)", (migration_path.name,))
             conn.commit()
     finally:

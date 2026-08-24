@@ -42,6 +42,13 @@ def test_growhub_crm_api_exposes_crm_companies_created_from_opportunity(tmp_path
     assert companies_payload[0]["name"] == "CRM Test Pharma"
     assert companies_payload[0]["source"] == "Green Book"
 
+    companies_search_response = client.get("/api/growhub/crm/companies?q=CRM+Test&page=1&per_page=10")
+    assert companies_search_response.status_code == 200
+    search_payload = companies_search_response.get_json()
+    assert isinstance(search_payload, list)
+    assert len(search_payload) == 1
+    assert search_payload[0]["name"] == "CRM Test Pharma"
+
     envelope_response = client.get("/api/growhub/crm/data")
     assert envelope_response.status_code == 200
     envelope_payload = envelope_response.get_json()
@@ -166,8 +173,9 @@ def test_crm_routes_redirect_to_configured_frontend(monkeypatch):
         assert response.headers["Location"] == "http://127.0.0.1:5173"
 
 
-def test_crm_routes_use_default_frontend_when_unconfigured(monkeypatch):
-    monkeypatch.delenv("MEDNOVA_CRM_FRONTEND_URL", raising=False)
+def test_crm_routes_use_default_frontend_when_unconfigured(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEDNOVA_CRM_FRONTEND_URL", "")
+    monkeypatch.chdir(tmp_path)
 
     import app as app_module
     app_module = importlib.reload(app_module)

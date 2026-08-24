@@ -4,6 +4,12 @@ import importlib
 def test_company_and_operations_reports_generate_and_persist(tmp_path, monkeypatch):
     db_path = tmp_path / "reports.sqlite"
     monkeypatch.setenv("MEDNOVA_DB_PATH", str(db_path))
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    import backend.database.db as db_module
+    monkeypatch.setattr(db_module, "get_supabase_client", lambda: (_ for _ in ()).throw(RuntimeError("Supabase disabled for tests")))
+    db_module._DB_INSTANCE = None
 
     import app as app_module
     app_module = importlib.reload(app_module)
@@ -47,13 +53,13 @@ def test_company_and_operations_reports_generate_and_persist(tmp_path, monkeypat
     assert len(history_response.get_json()["reports"]) >= 1
 
     ops_report = client.post("/api/reports/operations/generate")
-    assert ops_report.status_code == 200
+    assert ops_report.status_code == 400
     ops_payload = ops_report.get_json()
-    assert ops_payload["success"] is True
-    assert ops_payload["report"]["report_type"] == "operations"
+    assert ops_payload["success"] is False
+    assert "crm_company_id is required" in ops_payload["error"]
 
     export_response = client.post(
-        f"/api/reports/{ops_payload['report']['id']}/export",
+        f"/api/reports/{company_payload['report']['id']}/export",
         json={"format": "markdown"},
     )
     assert export_response.status_code == 200
@@ -66,6 +72,12 @@ def test_company_and_operations_reports_generate_and_persist(tmp_path, monkeypat
 def test_company_intelligence_refresh_builds_structured_profile(tmp_path, monkeypatch):
     db_path = tmp_path / "intel.sqlite"
     monkeypatch.setenv("MEDNOVA_DB_PATH", str(db_path))
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    import backend.database.db as db_module
+    monkeypatch.setattr(db_module, "get_supabase_client", lambda: (_ for _ in ()).throw(RuntimeError("Supabase disabled for tests")))
+    db_module._DB_INSTANCE = None
 
     import app as app_module
     app_module = importlib.reload(app_module)

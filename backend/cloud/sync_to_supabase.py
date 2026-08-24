@@ -64,6 +64,161 @@ def _normalize(value: Any) -> Any:
     return value
 
 
+def _ensure_crm_reports_invalid_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS crm_reports_invalid (
+            id INTEGER PRIMARY KEY,
+            crm_company_id INTEGER,
+            report_type TEXT,
+            report_name TEXT,
+            report_data TEXT,
+            executive_summary TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            quarantined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def _company_exists(conn: sqlite3.Connection, company_id: Any) -> bool:
+    if company_id is None:
+        return False
+    try:
+        row = conn.execute("SELECT 1 FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _row_to_dict(row: Any, columns: list[str]) -> dict[str, Any]:
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        return {column: row[idx] for idx, column in enumerate(columns)}
+
+
+def _normalize_company_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_company_candidates(payload: Any) -> tuple[set[int], set[str]]:
+    candidates_id: set[int] = set()
+    candidates_name: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                normalized_key = str(key).lower()
+                if normalized_key in {"company_id", "crm_company_id"}:
+                    company_id = _normalize_company_id(nested_value)
+                    if company_id is not None:
+                        candidates_id.add(company_id)
+                elif normalized_key == "company_name" and isinstance(nested_value, str) and nested_value.strip():
+                    candidates_name.add(nested_value.strip())
+                walk(nested_value)
+        elif isinstance(value, list):
+            for element in value:
+                walk(element)
+
+    walk(payload)
+    return candidates_id, candidates_name
+
+
+def _find_company_id_from_candidates(conn: sqlite3.Connection, candidate_ids: set[int], candidate_names: set[str]) -> int | None:
+    if len(candidate_ids) == 1:
+        company_id = next(iter(candidate_ids))
+        if _company_exists(conn, company_id):
+            return company_id
+    elif len(candidate_ids) > 1:
+        for candidate_id in candidate_ids:
+            if _company_exists(conn, candidate_id):
+                return candidate_id
+
+    if len(candidate_names) == 1:
+        company_name = next(iter(candidate_names))
+        row = conn.execute(
+            "SELECT id FROM crm_companies WHERE lower(company_name) = lower(?) LIMIT 1",
+            (company_name,),
+        ).fetchone()
+        if row:
+            return row[0]
+
+    return None
+
+
+def _recover_or_quarantine_crm_reports(conn: sqlite3.Connection) -> tuple[int, int, list[int], list[int]]:
+    if not _table_exists(conn, "crm_reports"):
+        return 0, 0, [], []
+    _ensure_crm_reports_invalid_table(conn)
+    try:
+        orphan_rows = conn.execute(
+            "SELECT * FROM crm_reports WHERE crm_company_id IS NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0, 0, [], []
+    recovered = 0
+    quarantined = 0
+    recovered_ids: list[int] = []
+    quarantined_ids: list[int] = []
+    for row in orphan_rows:
+        row_dict = _row_to_dict(row, list(row.keys()) if hasattr(row, 'keys') else [])
+        payload: dict[str, Any] = {}
+        report_data = row_dict.get("report_data")
+        if isinstance(report_data, str) and report_data:
+            try:
+                payload = json.loads(report_data)
+            except Exception:
+                payload = {}
+        elif isinstance(report_data, dict):
+            payload = report_data
+
+        candidate_ids, candidate_names = _extract_company_candidates(payload)
+        company_id = _normalize_company_id(payload.get("company_id") or payload.get("crm_company_id"))
+        if company_id is None:
+            company_id = _find_company_id_from_candidates(conn, candidate_ids, candidate_names)
+
+        if company_id is not None and _company_exists(conn, company_id):
+            conn.execute(
+                "UPDATE crm_reports SET crm_company_id = ? WHERE id = ?",
+                (company_id, row_dict["id"]),
+            )
+            recovered += 1
+            recovered_ids.append(row_dict["id"])
+            continue
+
+        conn.execute(
+            "INSERT OR REPLACE INTO crm_reports_invalid (id, crm_company_id, report_type, report_name, report_data, executive_summary, created_at, updated_at, quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (
+                row_dict["id"],
+                None,
+                row_dict.get("report_type"),
+                row_dict.get("report_name"),
+                row_dict.get("report_data"),
+                row_dict.get("executive_summary"),
+                row_dict.get("created_at"),
+                row_dict.get("updated_at"),
+            ),
+        )
+        conn.execute("DELETE FROM crm_reports WHERE id = ?", (row_dict["id"],))
+        quarantined += 1
+        quarantined_ids.append(row_dict["id"])
+
+    if orphan_rows:
+        conn.commit()
+    return recovered, quarantined, recovered_ids, quarantined_ids
+
+
 def _canonical_payload(row: dict[str, Any]) -> dict[str, Any]:
     payload = dict(row)
     payload = {key: _normalize(value) for key, value in payload.items() if value is not None}
@@ -122,6 +277,22 @@ def _upsert_rows(client: Any, table_name: str, rows: list[dict[str, Any]], key_f
     if not filtered_rows:
         return added, updated, unchanged, failed
 
+    if table_name == "crm_reports":
+        for payload, _ in filtered_rows:
+            for attempt in range(4):
+                try:
+                    upsert_response = client.table(table_name).upsert([payload], on_conflict=key_field).execute()
+                    if getattr(upsert_response, "data", None) is not None:
+                        added += 1
+                    else:
+                        failed.append({"table": table_name, "row": payload, "error": f"upsert_empty:{getattr(upsert_response, 'status_code', '')}:{getattr(upsert_response, 'text', '')}"})
+                    break
+                except Exception as exc:  # pragma: no cover - defensive path
+                    if attempt < 3:
+                        continue
+                    failed.append({"table": table_name, "row": payload, "error": str(exc)})
+        return added, updated, unchanged, failed
+
     for start in range(0, len(filtered_rows), 10):
         chunk = filtered_rows[start:start + 10]
         upsert_rows = [payload for payload, _ in chunk]
@@ -146,6 +317,20 @@ def _get_available_columns(conn: sqlite3.Connection, table_name: str) -> set[str
         return {row[1] for row in rows}
     except Exception:
         return set()
+
+
+def _filter_rows_for_table(table_name: str, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if table_name != "crm_reports":
+        return rows, []
+
+    valid_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("crm_company_id") is None:
+            skipped_rows.append(row)
+        else:
+            valid_rows.append(row)
+    return valid_rows, skipped_rows
 
 
 def _build_sync_query(table_name: str, columns: set[str]) -> str:
@@ -198,6 +383,24 @@ def _allowed_columns_for_table(table_name: str) -> set[str] | None:
         return {"id", "product_id", "expiry_date", "days_remaining", "alert_level", "created_at", "updated_at"}
     if table_name == "opportunities":
         return {"id", "product_id", "title", "description", "opportunity_type", "created_at", "updated_at"}
+    if table_name == "crm_companies":
+        return {"id", "company_name", "country", "opportunity_score", "portfolio_summary", "source", "report_context", "greenbook_products_json", "registration_numbers", "dosage_forms", "therapeutic_areas", "registration_dates", "opportunity_status", "pipeline_stage", "created_at", "updated_at"}
+    if table_name == "crm_contacts":
+        return {"id", "crm_company_id", "full_name", "role", "department", "email", "phone", "source", "created_at", "updated_at", "source_url", "discovered_at", "confidence_score", "verification_status", "website", "linkedin_url", "notes"}
+    if table_name == "crm_deals":
+        return {"id", "crm_company_id", "crm_contact_id", "title", "stage", "value", "currency", "probability", "expected_close_at", "owner", "description", "created_at", "updated_at"}
+    if table_name == "crm_tasks":
+        return {"id", "crm_company_id", "title", "description", "task_type", "status", "priority", "due_date", "assigned_to", "completed_at", "created_at", "updated_at"}
+    if table_name == "crm_notes":
+        return {"id", "crm_company_id", "body", "created_at"}
+    if table_name == "crm_outreach_emails":
+        return {"id", "crm_company_id", "crm_contact_id", "template_key", "template_name", "subject", "body", "recipient", "recipient_name", "sender_name", "sender_email", "from_email", "company_name", "contact_name", "status", "direction", "message_id", "error_message", "client_request_id", "created_at", "updated_at", "sent_at"}
+    if table_name == "crm_company_intelligence":
+        return {"id", "crm_company_id", "data", "search_results_json", "search_date", "search_status", "last_refresh", "source_summary", "created_at", "updated_at"}
+    if table_name == "crm_reports":
+        return {"id", "crm_company_id", "report_type", "report_name", "report_data", "executive_summary", "created_at", "updated_at"}
+    if table_name == "settings":
+        return {"id", "key", "value", "created_at", "updated_at"}
     if table_name == "sync_history":
         return {"id", "started_at", "finished_at", "status", "products_added", "products_updated", "products_removed", "duration_seconds", "error_message"}
     return None
@@ -213,6 +416,10 @@ def sync_sqlite_to_supabase(db_path: str | Path | None = None) -> dict[str, Any]
         "unchanged": 0,
         "failed": 0,
         "processed": 0,
+        "crm_reports_synced": 0,
+        "crm_reports_recovered": 0,
+        "crm_reports_quarantined": 0,
+        "skipped": 0,
         "duration_seconds": 0,
         "errors": [],
     }
@@ -222,8 +429,32 @@ def sync_sqlite_to_supabase(db_path: str | Path | None = None) -> dict[str, Any]
     conn = _connect_sqlite(db_path)
     try:
         client = get_supabase()
+        recovered, quarantined, recovered_ids, quarantined_ids = _recover_or_quarantine_crm_reports(conn)
+        summary["crm_reports_recovered"] = recovered
+        summary["crm_reports_recovered_ids"] = recovered_ids
+        summary["crm_reports_quarantined"] += quarantined
+        summary["crm_reports_quarantined_ids"] = quarantined_ids
+        if recovered or quarantined:
+            logger.info(
+                "crm_reports cleanup: recovered=%s quarantined=%s recovered_ids=%s quarantined_ids=%s",
+                recovered,
+                quarantined,
+                recovered_ids,
+                quarantined_ids,
+            )
+
         tables = [
             ("products", "registration_number"),
+            ("crm_companies", "id"),
+            ("crm_contacts", "id"),
+            ("crm_deals", "id"),
+            ("crm_tasks", "id"),
+            ("crm_notes", "id"),
+            ("crm_outreach_emails", "id"),
+            ("crm_company_intelligence", "id"),
+            ("revenue_pipeline", "id"),
+            ("crm_reports", "id"),
+            ("settings", "id"),
             ("manufacturers", "manufacturer_name"),
             ("applicants", "applicant_name"),
             ("renewal_alerts", "id"),
@@ -231,17 +462,32 @@ def sync_sqlite_to_supabase(db_path: str | Path | None = None) -> dict[str, Any]
             ("sync_history", "id"),
         ]
 
+        summary["tables"] = {}
+        summary["skipped"] = 0
+        failed_tables: list[str] = []
+
         for table_name, key_field in tables:
             if not _table_exists(conn, table_name):
                 logger.warning("skipping missing table %s", table_name)
+                summary["tables"][table_name] = 0
+                failed_tables.append(table_name)
                 continue
             processed_tables += 1
             columns = _get_available_columns(conn, table_name)
             query = _build_sync_query(table_name, columns)
-            if not _ensure_remote_table(client, table_name):
-                skipped_tables += 1
-                logger.warning("skipping %s because the remote table is not available", table_name)
+            try:
+                if not _ensure_remote_table(client, table_name):
+                    skipped_tables += 1
+                    failed_tables.append(table_name)
+                    logger.warning("skipping %s because the remote table is not available", table_name)
+                    continue
+            except Exception as exc:
+                summary["failed"] += 1
+                summary["errors"].append({"table": table_name, "error": str(exc)})
+                failed_tables.append(table_name)
+                logger.warning("failed remote table check for %s: %s", table_name, exc)
                 continue
+
             try:
                 cursor = conn.execute(query)
                 columns = [column[0] for column in cursor.description or []]
@@ -250,33 +496,54 @@ def sync_sqlite_to_supabase(db_path: str | Path | None = None) -> dict[str, Any]
                 logger.warning("could not read rows from %s using query %s: %s", table_name, query, exc)
                 summary["failed"] += 1
                 summary["errors"].append({"table": table_name, "error": str(exc)})
+                failed_tables.append(table_name)
                 continue
-            summary["processed"] += len(rows)
             if table_name == "products" and key_field == "registration_number":
                 rows = [row for row in rows if row.get("registration_number")]
+
+            total_rows = len(rows)
+            rows, skipped_rows = _filter_rows_for_table(table_name, rows)
+            summary["skipped"] += len(skipped_rows)
+            if table_name == "crm_reports":
+                for skipped_row in skipped_rows:
+                    logger.warning(
+                        "Skipping crm_report %s because crm_company_id is NULL",
+                        skipped_row.get("id"),
+                    )
+                    summary["errors"].append({
+                        "table": table_name,
+                        "row_id": skipped_row.get("id"),
+                        "error": "skipped row because crm_company_id is missing",
+                    })
+
             added, updated, unchanged, failed = _upsert_rows(client, table_name, rows, key_field, allowed_columns=_allowed_columns_for_table(table_name))
+            summary["tables"][table_name] = len(rows)
+            summary["processed"] += len(rows)
             summary["added"] += added
             summary["updated"] += updated
             summary["unchanged"] += unchanged
             summary["failed"] += len(failed)
             summary["errors"].extend(failed)
-            logger.info("table=%s processed=%s added=%s updated=%s unchanged=%s failed=%s", table_name, len(rows), added, updated, unchanged, len(failed))
+            if table_name == "crm_reports":
+                summary["crm_reports_synced"] = len(rows) - len(failed)
+            if failed:
+                failed_tables.append(table_name)
+            logger.info("table=%s processed=%s added=%s updated=%s unchanged=%s failed=%s skipped=%s", table_name, len(rows), added, updated, unchanged, len(failed), len(skipped_rows))
 
-        compare = {
-            "products": _count_supabase(client, "products"),
-            "manufacturers": _count_supabase(client, "manufacturers"),
-            "applicants": _count_supabase(client, "applicants"),
-            "renewals": _count_supabase(client, "renewal_alerts"),
-            "sync_history": _count_supabase(client, "sync_history"),
-        }
-        summary["compare"] = compare
+        counts = {}
+        for table_name, _ in tables:
+            counts[table_name] = _count_supabase(client, table_name)
+        summary["counts"] = counts
+        summary["failed_tables"] = sorted(set(failed_tables))
+
         summary["counts_match"] = all(
-            compare[key] == _count_sqlite(conn, table_name)
-            for key, table_name in [("products", "products"), ("manufacturers", "manufacturers"), ("applicants", "applicants"), ("renewals", "renewal_alerts"), ("sync_history", "sync_history")]
+            counts.get(table_name, 0) == _count_sqlite(conn, table_name)
+            for table_name, _ in tables if _table_exists(conn, table_name)
         )
+        summary["total_errors"] = len(summary["errors"])
         if skipped_tables and processed_tables and skipped_tables == processed_tables:
             summary["status"] = "skipped"
-        elif skipped_tables and summary["status"] == "success":
+        elif summary["failed_tables"] and summary["status"] == "success":
             summary["status"] = "partial"
     except Exception as exc:  # pragma: no cover - defensive path
         summary["status"] = "failed"
@@ -311,4 +578,11 @@ def _count_supabase(client: Any, table_name: str) -> int:
 
 
 if __name__ == "__main__":
-    print(json.dumps(sync_sqlite_to_supabase(), indent=2))
+    summary = sync_sqlite_to_supabase()
+    print(f"Products synced: {summary.get('tables', {}).get('products', 0)}")
+    print(f"CRM Companies synced: {summary.get('tables', {}).get('crm_companies', 0)}")
+    print(f"Revenue Pipeline synced: {summary.get('tables', {}).get('revenue_pipeline', 0)}")
+    print(f"CRM Reports synced: {summary.get('crm_reports_synced', 0)}")
+    print(f"CRM Reports recovered: {summary.get('crm_reports_recovered', 0)}")
+    print(f"CRM Reports quarantined: {summary.get('crm_reports_quarantined', 0)}")
+    print(f"Total Errors: {summary.get('total_errors', 0)}")

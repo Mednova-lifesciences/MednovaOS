@@ -46,3 +46,30 @@ def test_add_to_crm_creates_company_and_prevents_duplicates(tmp_path, monkeypatc
     # The application redirects CRM UI routes to the Lovable CRM frontend
     assert list_response.status_code == 302
     assert list_response.headers["Location"] == app_module._crm_frontend_target() + "/companies"
+
+
+def test_crm_service_fuzzy_company_matching_reuses_existing_company(tmp_path, monkeypatch):
+    db_path = tmp_path / "crm-fuzzy-match.sqlite"
+    monkeypatch.setenv("MEDNOVA_DB_PATH", str(db_path))
+
+    import app as app_module
+    app_module = importlib.reload(app_module)
+
+    from backend.services.crm_service import CRMService
+    from backend.database.repositories import CompanyRepository
+
+    company_repo = CompanyRepository()
+    company_repo.create({
+        "company_name": "Acme Pharma",
+        "country": "Nigeria",
+        "source": "Green Book",
+        "created_at": "2025-01-01T00:00:00Z",
+    })
+
+    crm_service = CRMService()
+    existing = crm_service._find_existing_company("Acme Pharmaceuticals")
+    assert existing is not None
+    assert (existing.company_name if hasattr(existing, "company_name") else existing.get("company_name")) == "Acme Pharma"
+
+    another = crm_service._find_existing_company("Acme Health Care Ltd")
+    assert another is None or (another.company_name if hasattr(another, "company_name") else another.get("company_name")) != "Acme Pharma"

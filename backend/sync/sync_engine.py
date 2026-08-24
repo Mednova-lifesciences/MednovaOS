@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -57,6 +59,7 @@ class SyncEngine:
                 estimated_value REAL NOT NULL DEFAULT 0,
                 recommended_services TEXT,
                 status TEXT,
+                expiry_date TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -75,7 +78,8 @@ class SyncEngine:
                        WHEN COALESCE(c.category_name, 'Unknown') = 'Medical devices' THEN 'Device registration support, renewal monitoring'
                        ELSE 'Registration support, renewal monitoring'
                    END AS recommended_services,
-                   'active' AS status
+                   'active' AS status,
+                   MIN(NULLIF(p.expiry_date, '')) AS expiry_date
             FROM products p
             LEFT JOIN manufacturers m ON m.id = p.manufacturer_id
             LEFT JOIN applicants a ON a.id = p.applicant_id
@@ -86,7 +90,7 @@ class SyncEngine:
         ).fetchall()
         for row in rows:
             conn.execute(
-                "INSERT INTO revenue_pipeline (company, category, products, estimated_value, recommended_services, status) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO revenue_pipeline (company, category, products, estimated_value, recommended_services, status, expiry_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     row["company"],
                     row["category"],
@@ -94,6 +98,7 @@ class SyncEngine:
                     float(row["estimated_value"] or 0),
                     row["recommended_services"],
                     row["status"],
+                    row["expiry_date"],
                 ),
             )
         return len(rows)
@@ -111,6 +116,15 @@ class SyncEngine:
         }
         return report
 
+    def _sync_companies_from_products(self, conn: sqlite3.Connection) -> None:
+        """CRM company creation is intentionally disabled in Green Book sync.
+
+        Explicit company creation must be performed by the user through the Add-to-CRM workflow.
+        This keeps Green Book intelligence separate from the CRM and avoids auto-creating
+        CRM company records during sync.
+        """
+        self.logger.info("Skipping CRM company creation during Green Book sync. Add-to-CRM is explicit.")
+        return None
     def run(self) -> dict[str, Any]:
         started_at = datetime.now(timezone.utc)
         self.logger.info("Synchronization started")
@@ -178,6 +192,9 @@ class SyncEngine:
                     self.logger.exception("Failed processing product: %s", exc)
                     summary["errors"] += 1
                     checkpoint.save(page, None, max(1, (total_items + self.batch_size - 1) // self.batch_size), "running")
+            # Explicit Add-to-CRM workflow handles CRM company creation and enrichment.
+            # Green Book sync only updates product, renewal, opportunity, and pipeline data.
+
             summary["removed"] = updater.mark_removed_products(active_registrations)
             summary["stages"].append({"function": "SyncUpdater.mark_removed_products", "rows_inserted": 0, "rows_updated": summary["removed"], "duration_ms": 0.0})
             renewal = RenewalEngine(conn)

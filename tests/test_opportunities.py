@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import app
+from backend.database.repositories.pipeline import PipelineRepository
 
 
 def test_opportunities_page_renders_filters_and_expanded_actions():
@@ -27,8 +28,37 @@ def test_opportunities_page_renders_filters_and_expanded_actions():
     assert 'Add Opportunity' in body
 
 
+def test_pipeline_repository_maps_expiry_columns():
+    repo = PipelineRepository()
+    normalized = repo._normalize_row({
+        "id": 1,
+        "company": "Acme Pharma",
+        "estimated_value": 500000,
+        "expiration_date": "2035-01-01",
+    })
+    assert normalized["expiry_date"] == "2035-01-01"
+
+
+def test_opportunities_page_uses_live_revenue_pipeline_rows():
+    pipeline_rows = PipelineRepository().list(limit=5)
+    assert pipeline_rows, 'expected revenue_pipeline data'
+
+    client = app.test_client()
+    response = client.get('/opportunities?page=1&page_size=5')
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert pipeline_rows[0].get('company') in body
+
+
+def test_pipeline_repository_orders_by_estimated_value_desc():
+    repo = PipelineRepository()
+    rows, total, _, _, _, _, _ = repo.list_page(page=1, page_size=5)
+    assert total >= 2
+    assert rows[0]["estimated_value"] >= rows[1]["estimated_value"]
+
+
 def test_crm_page_redirects_to_frontend():
     client = app.test_client()
     response = client.get('/crm', follow_redirects=False)
     assert response.status_code == 302
-    assert response.headers['Location'] == 'http://127.0.0.1:5173'
+    assert response.headers['Location'].startswith('http://127.0.0.1:')

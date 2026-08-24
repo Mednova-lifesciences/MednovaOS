@@ -6,8 +6,9 @@ import re
 import sqlite3
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import quote_plus, urlparse
 
@@ -15,10 +16,35 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, render_template_string, request, url_for
+from flask_cors import CORS
 
-from backend.cloud.sync_to_supabase import sync_sqlite_to_supabase
-from backend.services.crm_service import add_activity, add_note, complete_task, create_company_from_payload, create_contact, create_task
-from backend.database.repositories import companies as companies_repo
+from backend.database.db import get_db
+from backend.database.repositories import (
+    ActivityRepository,
+    CompanyRepository,
+    ContactRepository,
+    DealRepository,
+    NoteRepository,
+    OutreachRepository,
+    PipelineRepository,
+    ProductRepository,
+    TaskRepository,
+)
+from backend.database.repositories.renewals import RenewalRepository
+from backend.logging_utils import get_logger
+from backend.services.company_service import CompanyService
+from backend.services.contact_service import ContactService
+from backend.services.crm_service import CRMService
+from backend.services.intelligence_service import IntelligenceService
+from backend.services.outreach_service import OutreachService
+from backend.services.report_service import ReportService
+from backend.services.task_service import TaskService
+from backend.services.pipeline_service import PipelineService
+from backend.sync.scheduler import SyncScheduler
+from backend.sync.sync_engine import run_sync
+from backend.utils import format_response, now_iso
+
+logger = get_logger("app")
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATHS = [BASE_DIR / ".env", Path.cwd() / ".env"]
@@ -35,13 +61,13 @@ def _read_env_value(*names: str, default: str = "") -> str:
 def _load_environment(env_path: Path | None = None) -> dict:
     resolved_path = env_path or next((candidate for candidate in ENV_PATHS if candidate.exists()), BASE_DIR / ".env")
     if env_path is not None:
-        load_dotenv(env_path, override=True)
+        load_dotenv(env_path, override=False)
     else:
         for candidate in ENV_PATHS:
             if candidate.exists():
-                load_dotenv(candidate, override=True)
+                load_dotenv(candidate, override=False)
         if not resolved_path.exists():
-            load_dotenv(override=True)
+            load_dotenv(override=False)
 
     sender_email = _read_env_value("FROM_EMAIL", "RESEND_FROM_EMAIL", "SENDER_EMAIL", default="info@mednovalife.com")
     sender_name = _read_env_value("SENDER_NAME", "ORGANIZATION_NAME", "ORG_NAME", "COMPANY_NAME", default="MedNova Lifesciences")
@@ -92,32 +118,24 @@ def _crm_deal_stage_to_frontend(stage: str | None) -> str:
 
 
 def _crm_deal_payload_from_row(row) -> dict:
+    data = _to_plain_dict(row) if not isinstance(row, dict) else dict(row)
+    stage_value = data.get("stage") or data.get("status") or data.get("pipeline_stage") or data.get("opportunity_status")
+    title_value = data.get("title") or data.get("company_name") or data.get("company") or "Deal"
+    value = data.get("value") or data.get("amount") or data.get("estimated_value") or 0
+    probability = data.get("probability") or 0
     return {
-        "id": int(row["id"]),
-        "companyId": int(row["crm_company_id"]),
-        "contactId": int(row["crm_contact_id"]) if row["crm_contact_id"] is not None else None,
-        "title": row["title"] or "Deal",
-        "stage": _crm_deal_stage_to_frontend(row["stage"]),
-        "value": int(row["value"] or 0),
-        "currency": (row["currency"] or "NGN").upper() if (row["currency"] or "NGN") else "NGN",
-        "probability": int(row["probability"] or 0),
-        "expectedCloseAt": row["expected_close_at"],
-        "owner": row["owner"],
-        "description": row["description"] or "",
+        "id": int(data.get("id") or data.get("opportunity_id") or 0),
+        "companyId": int(data.get("crm_company_id") or data.get("company_id") or 0),
+        "contactId": int(data["crm_contact_id"]) if data.get("crm_contact_id") is not None else None,
+        "title": title_value,
+        "stage": _crm_deal_stage_to_frontend(stage_value),
+        "value": int(float(value or 0)),
+        "currency": (data.get("currency") or "NGN").upper() if (data.get("currency") or "NGN") else "NGN",
+        "probability": int(float(probability or 0)),
+        "expectedCloseAt": data.get("expected_close_at") or data.get("expiry_date"),
+        "owner": data.get("owner"),
+        "description": data.get("description") or data.get("recommended_services") or "",
     }
-
-
-def _create_pipeline_deal_row(conn, company_id: int, title: str, stage: str, value: int, currency: str, probability: int, expected_close_at, owner: str, description: str):
-    cursor = conn.execute(
-        """
-        INSERT INTO crm_deals (
-            crm_company_id, crm_contact_id, title, stage, value, currency, probability, expected_close_at, owner, description
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (company_id, None, title, stage, value, currency, probability, expected_close_at, owner, description),
-    )
-    row_id = int(cursor.lastrowid)
-    return conn.execute("SELECT id, crm_company_id, crm_contact_id, title, stage, value, currency, probability, expected_close_at, owner, description FROM crm_deals WHERE id = ?", (row_id,)).fetchone()
 
 
 def _dedupe_deals_by_id(deals: list[dict]) -> list[dict]:
@@ -132,123 +150,124 @@ def _dedupe_deals_by_id(deals: list[dict]) -> list[dict]:
     return deduped
 
 
-def _build_growhub_pipeline_deals(conn, companies) -> list[dict]:
-    deals = []
-    created_any = False
+def _build_growhub_pipeline_deals(companies: list[dict]) -> list[dict]:
+    pipeline_service = PipelineService()
+    deals: list[dict] = []
     for company in companies:
-        company_id = int(company["id"])
-        company_name = company["name"]
-
-        existing_deals = conn.execute(
-            "SELECT id, crm_company_id, crm_contact_id, title, stage, value, currency, probability, expected_close_at, owner, description FROM crm_deals WHERE crm_company_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
-            (company_id,),
-        ).fetchall()
-        if existing_deals:
+        company_payload = _to_plain_dict(company)
+        company_id = int(company_payload.get("id") or 0)
+        if not company_id:
             continue
 
-        company_row = conn.execute(
-            "SELECT pipeline_stage, opportunity_score FROM crm_companies WHERE id = ?",
-            (company_id,),
-        ).fetchone()
-        stage = _crm_deal_stage_to_frontend(company_row["pipeline_stage"] if company_row else None)
-        probability = int(company_row["opportunity_score"] or 0) if company_row else 0
-        fallback_value = 0
-        if table_exists(conn, "revenue_pipeline"):
-            revenue_row = conn.execute(
-                "SELECT estimated_value FROM revenue_pipeline WHERE lower(company) = ? LIMIT 1",
-                (company_name.lower(),),
-            ).fetchone()
-            if revenue_row and revenue_row["estimated_value"] is not None:
-                fallback_value = int(float(revenue_row["estimated_value"]) or 0)
-        created_row = _create_pipeline_deal_row(
-            conn,
-            company_id,
-            f"{company_name} opportunity",
-            stage,
-            fallback_value,
-            "NGN",
-            probability,
-            None,
-            "MedNovaOS",
-            "",
-        )
-        created_any = True
-        deals.append(_crm_deal_payload_from_row(created_row))
-    if created_any:
-        conn.commit()
+        existing_deals = pipeline_service.list_deals(company_id, page=1, per_page=100).get("items", [])
+        if existing_deals:
+            deals.extend([_crm_deal_payload_from_row(deal) for deal in existing_deals])
+            continue
+
+        company_name = company_payload.get("company_name") or company_payload.get("name") or ""
+        if not company_name:
+            continue
+
+        fallback = _build_revenue_pipeline_deal(company_id, company_name, company_payload.get("pipeline_stage"), company_payload.get("opportunity_score"))
+        if fallback:
+            deals.append(fallback)
     return deals
-from backend.sync.scheduler import SyncScheduler
-from backend.sync.sync_engine import run_sync
-from database.apply_migrations import apply_migrations
-from database.init_db import initialize_database
-
-DEFAULT_DB_PATH = BASE_DIR / "database" / "nafdac_intelligence.db"
 
 
-def _get_setting_value(name: str, fallback: str | None = None) -> str | None:
-    return (os.getenv(name) or os.getenv("DATABASE_PATH") or fallback or "").strip() or None
+def _build_revenue_pipeline_deal(company_id: int, company_name: str, pipeline_stage: str | None, opportunity_score: int | str | None) -> dict | None:
+    conn = connect()
+    try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='revenue_pipeline' LIMIT 1"
+        ).fetchone()
+        if not table_exists:
+            return None
+
+        cursor = conn.execute(
+            "SELECT estimated_value, category, products, recommended_services, status FROM revenue_pipeline WHERE lower(company) = ? LIMIT 1",
+            (company_name.lower(),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        if isinstance(row, sqlite3.Row):
+            row_data = dict(row)
+        else:
+            columns = [column[0] for column in cursor.description] if cursor.description else []
+            row_data = dict(zip(columns, row))
+
+        value = int(float(row_data.get("estimated_value") or 0))
+        probability = int(opportunity_score or 0)
+        return _crm_deal_payload_from_row({
+            "id": company_id,
+            "crm_company_id": company_id,
+            "crm_contact_id": None,
+            "title": f"{company_name} opportunity",
+            "stage": pipeline_stage,
+            "value": value,
+            "currency": "NGN",
+            "probability": probability,
+            "expected_close_at": None,
+            "owner": "MedNovaOS",
+            "description": (row_data.get("recommended_services") or "") or "",
+        })
+    finally:
+        conn.close()
 
 
-def db_path() -> Path:
-    configured = _get_setting_value("MEDNOVA_DB_PATH")
-    if configured:
-        path = Path(configured).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-    return DEFAULT_DB_PATH
-
-
-def connect() -> sqlite3.Connection:
-    db_file = db_path()
-    conn = sqlite3.connect(db_file, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    _ensure_contact_enrichment_columns(conn)
-    _ensure_outreach_tables(conn)
-    _ensure_outreach_columns(conn)
-    _ensure_report_tables(conn)
-    conn.commit()
-    return conn
-
-
-def table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
-
-
-def _ensure_contact_enrichment_columns(conn: sqlite3.Connection) -> None:
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(crm_contacts)").fetchall()}
-    additions = [
-        ("source_url", "TEXT"),
-        ("discovered_at", "TEXT"),
-        ("confidence_score", "REAL"),
-        ("verification_status", "TEXT"),
-        ("website", "TEXT"),
-        ("linkedin_url", "TEXT"),
-        ("notes", "TEXT"),
+def _build_growhub_crm_dashboard_summary(companies: list[dict], deals: list[dict], tasks: list[dict]) -> dict:
+    normalized_companies = [_to_plain_dict(company) for company in companies]
+    active_leads = sum(
+        1
+        for company in normalized_companies
+        if _crm_company_status_for_row(company) == "prospect"
+    )
+    won_clients = sum(
+        1
+        for company in normalized_companies
+        if str(company.get("opportunity_status") or company.get("pipeline_stage") or "").strip().lower() == "won"
+    )
+    active_pipeline_rows = [
+        row
+        for row in deals
+        if str(row.get("status") or row.get("stage") or "").strip().lower() not in {"won", "lost", "closed"}
     ]
-    for column_name, column_type in additions:
-        if column_name not in columns:
-            conn.execute(f"ALTER TABLE crm_contacts ADD COLUMN {column_name} {column_type}")
+    pipeline_value = sum(int(float(row.get("value") or row.get("estimated_value") or 0)) for row in active_pipeline_rows)
+    weighted_pipeline_value = sum(
+        int(float(row.get("value") or row.get("estimated_value") or 0)) * int(float(row.get("probability") or 0)) / 100.0
+        for row in active_pipeline_rows
+    )
+    now = datetime.now(timezone.utc)
+    tasks_due = 0
+    meetings_scheduled = 0
+    for task in tasks:
+        task_row = _to_plain_dict(task) if not isinstance(task, dict) else dict(task)
+        status = str(task_row.get("status") or "").strip().lower()
+        due_date = task_row.get("due_date")
+        task_type = str(task_row.get("task_type") or task_row.get("type") or "").strip().lower()
+        if due_date:
+            try:
+                due_at = datetime.fromisoformat(str(due_date).replace("Z", "+00:00"))
+                if due_at.tzinfo is None:
+                    due_at = due_at.replace(tzinfo=timezone.utc)
+                if status != "completed" and due_at <= now + timedelta(days=3):
+                    tasks_due += 1
+                if task_type == "meeting" and due_at >= now:
+                    meetings_scheduled += 1
+            except Exception:
+                pass
 
-
-def _ensure_outreach_columns(conn: sqlite3.Connection) -> None:
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(crm_outreach_emails)").fetchall()}
-    additions = [
-        ("template_key", "TEXT"),
-        ("template_name", "TEXT"),
-        ("recipient_name", "TEXT"),
-        ("sender_name", "TEXT"),
-        ("sender_email", "TEXT"),
-        ("from_email", "TEXT"),
-        ("company_name", "TEXT"),
-        ("contact_name", "TEXT"),
-        ("message_id", "TEXT"),
-        ("error_message", "TEXT"),
-        ("client_request_id", "TEXT"),
-    ]
-    for column_name, column_type in additions:
-        if column_name not in columns:
-            conn.execute(f"ALTER TABLE crm_outreach_emails ADD COLUMN {column_name} {column_type}")
+    return {
+        "companiesAdded": len(normalized_companies),
+        "activeLeads": active_leads,
+        "activeOpportunities": len(active_pipeline_rows),
+        "wonClients": won_clients,
+        "tasksDue": tasks_due,
+        "meetingsScheduled": meetings_scheduled,
+        "pipelineValue": pipeline_value,
+        "weightedPipelineValue": int(weighted_pipeline_value),
+    }
 
 
 def _normalize_contact_value(value: object) -> str:
@@ -271,40 +290,64 @@ def _is_placeholder_contact_name(name_value: str, company_name: str = "") -> boo
     return False
 
 
-def _ensure_outreach_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS crm_outreach_emails (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            crm_company_id INTEGER NOT NULL,
-            crm_contact_id INTEGER,
-            template_key TEXT,
-            template_name TEXT,
-            subject TEXT NOT NULL,
-            body TEXT NOT NULL,
-            recipient TEXT,
-            recipient_name TEXT,
-            sender_name TEXT,
-            sender_email TEXT,
-            from_email TEXT,
-            company_name TEXT,
-            contact_name TEXT,
-            status TEXT NOT NULL DEFAULT 'draft',
-            direction TEXT NOT NULL DEFAULT 'outbound',
-            message_id TEXT,
-            error_message TEXT,
-            client_request_id TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            sent_at TEXT,
-            FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE,
-            FOREIGN KEY (crm_contact_id) REFERENCES crm_contacts(id) ON DELETE SET NULL
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_outreach_company ON crm_outreach_emails(crm_company_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_outreach_status ON crm_outreach_emails(status)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_outreach_created ON crm_outreach_emails(created_at)")
+def _is_generic_or_placeholder_email(email: str) -> bool:
+    normalized = email.strip().lower()
+    if not normalized:
+        return True
+    generic_domains = {"example.com", "example.org", "example.net", "test.com", "test.org", "localhost"}
+    local_part = normalized.split("@", 1)[0] if "@" in normalized else normalized
+    domain = normalized.split("@", 1)[1] if "@" in normalized else ""
+    if any(token in normalized for token in ["example.", "test.", "localhost", "noreply@", "no-reply@", "do-not-reply@", "admin@", "contact@", "hello@", "info@"]):
+        return True
+    if domain in generic_domains:
+        return True
+    return False
+
+
+def _is_placeholder_contact_record(contact: dict | Any | None, company_name: str = "") -> bool:
+    if not contact:
+        return True
+
+    payload = _to_plain_dict(contact)
+    full_name = _normalize_contact_value(payload.get("full_name") or payload.get("name") or "")
+    role = _normalize_contact_value(payload.get("role") or "")
+    email = _normalize_contact_value(payload.get("email") or "")
+    phone = _normalize_contact_value(payload.get("phone") or "")
+
+    if not full_name and not role:
+        return True
+    if _is_placeholder_contact_name(full_name, company_name):
+        return True
+    placeholder_roles = {"public contact", "primary contact", "company contact", "commercial lead", "lead"}
+    if role.lower() in placeholder_roles and not (email or phone):
+        return True
+    if _is_generic_or_placeholder_email(email) and not phone:
+        return True
+    return False
+
+
+def _cleanup_placeholder_contacts(company_id: int, company_name: str) -> int:
+    contact_service = ContactService()
+    contacts = [_to_plain_dict(contact) for contact in contact_service.list_contacts(company_id, page=1, per_page=1000).get("items", [])]
+    discovered_contacts = [
+        contact
+        for contact in contacts
+        if (contact.get("source") or "").strip().lower() == "discovered"
+        and ((contact.get("email") or "").strip() or (contact.get("phone") or "").strip() or (contact.get("linkedin_url") or "").strip())
+    ]
+    if not discovered_contacts:
+        return 0
+
+    deleted_count = 0
+    for contact in contacts:
+        if contact in discovered_contacts:
+            continue
+        if _is_placeholder_contact_record(contact, company_name):
+            contact_id = int(contact.get("id") or 0)
+            if contact_id and contact_service.delete_contact(contact_id):
+                deleted_count += 1
+
+    return deleted_count
 
 
 def _build_template_catalog() -> list[dict]:
@@ -376,6 +419,48 @@ def _default_from_email() -> str:
     return _default_sender_email()
 
 
+def _to_plain_dict(value: Any) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "__dict__") and not isinstance(value, (str, int, float, bool)):
+        return {key: val for key, val in vars(value).items() if not key.startswith("_")}
+    return {}
+
+
+def _get_sqlite_db_path() -> Path:
+    configured = os.getenv("MEDNOVA_DB_PATH") or os.getenv("DATABASE_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return BASE_DIR / "database" / "nafdac_intelligence.db"
+
+
+def connect() -> sqlite3.Connection:
+    db_path = _get_sqlite_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(db_path, timeout=30)
+
+
+def _to_plain_list(value: Any) -> list[dict]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [_to_plain_dict(item) for item in value]
+    return [_to_plain_dict(value)]
+
+
+def _parse_int_query_arg(name: str, default: int, min_value: int = 1, max_value: int | None = None) -> int:
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 def _outreach_status_payload() -> dict:
     environment_state = _load_environment()
     sender_email = environment_state["senderEmail"]
@@ -398,24 +483,19 @@ def _outreach_status_payload() -> dict:
     }
 
 
-def _build_outreach_preview(conn: sqlite3.Connection, company_id: int, template_key: str, contact_ids: list[int] | None = None, sender_name: str = "", sender_email: str = "", recipient: str = "", recipient_name: str = "", contact_id: int | None = None) -> dict:
+def _build_outreach_preview(company_id: int, template_key: str, contact_ids: list[int] | None = None, sender_name: str = "", sender_email: str = "", recipient: str = "", recipient_name: str = "", contact_id: int | None = None) -> dict:
     templates = _build_template_catalog()
     template = next((entry for entry in templates if entry["key"] == (template_key or "introduction")), templates[0])
-    context = _extract_outreach_context(conn, company_id, contact_ids, sender_name or _default_sender_name(), sender_email or _default_sender_email())
+    context = _extract_outreach_context(None, company_id, contact_ids, sender_name or _default_sender_name(), sender_email or _default_sender_email())
     primary_contact = context.get("primary_contact")
     company_name = _normalize_contact_value(context.get("company_name") or "Company")
 
-    def _candidate_name(contact: sqlite3.Row | dict | None) -> str:
-        if isinstance(contact, sqlite3.Row):
-            return _normalize_contact_value(contact["full_name"] or "")
+    def _candidate_name(contact: dict | Any | None) -> str:
         if isinstance(contact, dict):
             return _normalize_contact_value(contact.get("full_name") or "")
         return ""
 
-    if isinstance(primary_contact, sqlite3.Row):
-        resolved_name = _normalize_contact_value(recipient_name or primary_contact["full_name"] or "")
-        resolved_email = (recipient or primary_contact["email"] or "").strip()
-    elif isinstance(primary_contact, dict):
+    if isinstance(primary_contact, dict):
         resolved_name = _normalize_contact_value(recipient_name or primary_contact.get("full_name") or "")
         resolved_email = (recipient or primary_contact.get("email") or "").strip()
     else:
@@ -427,9 +507,7 @@ def _build_outreach_preview(conn: sqlite3.Connection, company_id: int, template_
 
     if not resolved_email and context.get("contacts"):
         for contact in context.get("contacts") or []:
-            if isinstance(contact, sqlite3.Row):
-                email = (contact["email"] or "").strip()
-            elif isinstance(contact, dict):
+            if isinstance(contact, dict):
                 email = (contact.get("email") or "").strip()
             else:
                 email = ""
@@ -485,7 +563,7 @@ def _append_signature(body: str, sender_name: str, sender_email: str) -> str:
     )
 
 
-def _resolve_outreach_persist_details(conn: sqlite3.Connection, company_id: int, company_name: str, payload: dict, template_key: str | None = None, sender_name: str = "", sender_email: str = "") -> dict:
+def _resolve_outreach_persist_details(company_id: int, company_name: str, payload: dict, template_key: str | None = None, sender_name: str = "", sender_email: str = "") -> dict:
     payload = dict(payload or {})
     contact_id = payload.get("contact_id")
     if contact_id is not None and str(contact_id).strip():
@@ -501,7 +579,6 @@ def _resolve_outreach_persist_details(conn: sqlite3.Connection, company_id: int,
     request_id = (payload.get("request_id") or payload.get("client_request_id") or "").strip()
 
     preview_data = _build_outreach_preview(
-        conn,
         company_id,
         payload.get("template_key") or template_key or "introduction",
         contact_ids,
@@ -625,28 +702,30 @@ def _coerce_request_payload() -> dict:
     return {key: (value if value is not None else "") for key, value in form_payload.items()}
 
 
-def _extract_outreach_context(conn: sqlite3.Connection, company_id: int, contact_ids: list[int] | None = None, sender_name: str = "", sender_email: str = "") -> dict:
-    company = conn.execute("SELECT id, company_name, country, opportunity_score, portfolio_summary, report_context FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+def _extract_outreach_context(conn: Any, company_id: int, contact_ids: list[int] | None = None, sender_name: str = "", sender_email: str = "") -> dict:
+    company_service = CompanyService()
+    company = company_service.get_company(company_id)
     if not company:
         raise LookupError("company not found")
 
-    company_name = company["company_name"] or "Company"
+    company_data = _to_plain_dict(company)
+    company_name = (company_data.get("company_name") or "Company").strip() or "Company"
     company_label = (company_name or "company").lower()
 
-    def _contact_value(contact: sqlite3.Row | dict | None, key: str) -> str:
+    def _contact_value(contact: dict | Any | None, key: str) -> str:
         if not contact:
             return ""
-        if isinstance(contact, dict):
-            return _normalize_contact_value(contact.get(key) or "")
-        return _normalize_contact_value(contact[key] if key in contact.keys() else "")
+        payload = _to_plain_dict(contact)
+        return _normalize_contact_value(payload.get(key) or "")
 
-    def _is_placeholder_contact(contact: sqlite3.Row | dict | None) -> bool:
+    def _is_placeholder_contact(contact: dict | Any | None) -> bool:
         if not contact:
             return True
-        full_name = _contact_value(contact, "full_name")
-        role = _contact_value(contact, "role")
-        email = _contact_value(contact, "email")
-        phone = _contact_value(contact, "phone")
+        payload = _to_plain_dict(contact)
+        full_name = _contact_value(payload, "full_name")
+        role = _contact_value(payload, "role")
+        email = _contact_value(payload, "email")
+        phone = _contact_value(payload, "phone")
         if not full_name and not role:
             return True
         if full_name.lower() == f"{company_label} commercial lead" or full_name.lower() == f"{company_label} lead":
@@ -655,15 +734,17 @@ def _extract_outreach_context(conn: sqlite3.Connection, company_id: int, contact
             return True
         return False
 
-    contacts = conn.execute("SELECT id, full_name, email, role FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC", (company_id,)).fetchall()
+    contact_service = ContactService()
+    contacts_payload = contact_service.list_contacts(company_id, page=1, per_page=1000)
+    contacts = _to_plain_list(contacts_payload.get("items", []))
 
     primary_contact = None
     if contact_ids:
         requested_contacts = []
         for contact_id in contact_ids:
-            contact = conn.execute("SELECT id, full_name, email, role FROM crm_contacts WHERE crm_company_id = ? AND id = ? LIMIT 1", (company_id, contact_id)).fetchone()
-            if contact:
-                requested_contacts.append(contact)
+            match = next((contact for contact in contacts if int(contact.get("id") or 0) == int(contact_id)), None)
+            if match:
+                requested_contacts.append(match)
         for contact in requested_contacts:
             if not _is_placeholder_contact(contact):
                 primary_contact = contact
@@ -673,25 +754,26 @@ def _extract_outreach_context(conn: sqlite3.Connection, company_id: int, contact
         for contact in contacts:
             if _is_placeholder_contact(contact):
                 continue
-            if contact["email"]:
+            if contact.get("email"):
                 primary_contact = contact
                 break
             if not primary_contact:
                 primary_contact = contact
 
     if primary_contact is None:
-        primary_contact = contacts[0] if contacts else {
+        primary_contact = {
             "full_name": f"{company_name} Commercial Lead",
             "email": "",
             "role": "Commercial Lead",
         }
-    country = company["country"] or "Unknown"
-    portfolio_summary = company["portfolio_summary"] or ""
-    opportunity_score = company["opportunity_score"] or 0
+    country = company_data.get("country") or "Unknown"
+    portfolio_summary = company_data.get("portfolio_summary") or ""
+    opportunity_score = company_data.get("opportunity_score") or 0
     product_name = "your lead product"
-    if company["report_context"]:
+    report_context = company_data.get("report_context") or ""
+    if report_context:
         try:
-            parsed = json.loads(company["report_context"] or "[]")
+            parsed = json.loads(report_context or "[]")
             if isinstance(parsed, list) and parsed:
                 first_item = parsed[0]
                 if isinstance(first_item, dict):
@@ -718,7 +800,7 @@ def _extract_outreach_context(conn: sqlite3.Connection, company_id: int, contact
 def _extract_contact_details_from_html(url: str, html: str, company_name: str) -> dict:
     soup = BeautifulSoup(html or "", "html.parser")
     text = " ".join(soup.stripped_strings)
-    emails = [match.group(0) for match in EMAIL_RE.finditer(text)]
+    emails = [match.group(0) for match in EMAIL_RE.finditer(text) if not _is_generic_or_placeholder_email(match.group(0))]
     phones = []
     for match in PHONE_RE.findall(text):
         cleaned = re.sub(r"\s+", "", match)
@@ -758,178 +840,57 @@ def _extract_contact_details_from_html(url: str, html: str, company_name: str) -
     }
 
 
-def _prune_placeholder_contacts(conn: sqlite3.Connection, company_id: int) -> None:
-    placeholders = conn.execute(
-        """
-        SELECT id FROM crm_contacts
-        WHERE crm_company_id = ? AND source != 'discovered' AND COALESCE(email, '') = '' AND COALESCE(phone, '') = '' AND COALESCE(linkedin_url, '') = ''
-        ORDER BY created_at DESC
-        """,
-        (company_id,),
-    ).fetchall()
-    if not placeholders:
-        return
-
-    discovered_contacts = conn.execute(
-        "SELECT id FROM crm_contacts WHERE crm_company_id = ? AND source = 'discovered'",
-        (company_id,),
-    ).fetchall()
-    if not discovered_contacts:
-        return
-
-    placeholder_ids = [row["id"] for row in placeholders]
-    conn.execute(
-        "DELETE FROM crm_contacts WHERE id IN ({})".format(", ".join("?" for _ in placeholder_ids)),
-        placeholder_ids,
-    )
+def _get_outreach_by_request_id(company_id: int, request_id: str):
+    if not request_id:
+        return None
+    repository = OutreachService().outreach_repo
+    records = repository.list(filters={"crm_company_id": company_id, "client_request_id": request_id}, order="created_at.desc", limit=1)
+    if not records:
+        return None
+    return _to_plain_dict(records[0])
 
 
-def _upsert_discovered_contact(conn: sqlite3.Connection, company_id: int, contact_data: dict) -> tuple[int, bool, bool, bool]:
-    full_name = _normalize_contact_value(contact_data.get("name") or contact_data.get("full_name") or "Public Contact")
-    role = _normalize_contact_value(contact_data.get("role") or contact_data.get("position") or "Public contact")
-    email = _normalize_contact_value(contact_data.get("email") or "")
-    phone = _normalize_contact_value(contact_data.get("phone") or "")
-    linkedin_url = _normalize_contact_value(contact_data.get("linkedin_url") or contact_data.get("linkedin") or "")
-    website = _normalize_contact_value(contact_data.get("website") or "")
-    source_url = _normalize_contact_value(contact_data.get("source_url") or "")
-    confidence_score = float(contact_data.get("confidence_score") or 0.0)
-    verification_status = _normalize_contact_value(contact_data.get("verification_status") or "pending")
+def _is_duplicate_contact(existing: dict, candidate: dict) -> bool:
+    if not existing or not candidate:
+        return False
+    existing_linkedin = (existing.get("linkedin_url") or "").strip().lower()
+    candidate_linkedin = (candidate.get("linkedin_url") or "").strip().lower()
+    if existing_linkedin and candidate_linkedin and existing_linkedin == candidate_linkedin:
+        return True
 
-    if not full_name and not email and not phone and not linkedin_url:
-        return 0, False, False, False
+    existing_email = (existing.get("email") or "").strip().lower()
+    candidate_email = (candidate.get("email") or "").strip().lower()
+    if existing_email and candidate_email and existing_email == candidate_email:
+        return True
 
-    existing = None
-    if email or phone or linkedin_url:
-        existing = conn.execute(
-            """
-            SELECT id, source FROM crm_contacts
-            WHERE crm_company_id = ? AND (
-                (email IS NOT NULL AND email != '' AND email = ?) OR
-                (phone IS NOT NULL AND phone != '' AND phone = ?) OR
-                (linkedin_url IS NOT NULL AND linkedin_url != '' AND linkedin_url = ?)
-            )
-            LIMIT 1
-            """,
-            (company_id, email, phone, linkedin_url),
-        ).fetchone()
+    existing_phone = re.sub(r"\D+", "", (existing.get("phone") or ""))
+    candidate_phone = re.sub(r"\D+", "", (candidate.get("phone") or ""))
+    if existing_phone and candidate_phone and existing_phone == candidate_phone:
+        return True
 
-    if existing:
-        return int(existing["id"]), False, False, True
+    existing_name = _normalize_contact_value(existing.get("full_name") or existing.get("name") or "").lower()
+    candidate_name = _normalize_contact_value(candidate.get("name") or candidate.get("full_name") or "").lower()
+    if existing_name and candidate_name and existing_name == candidate_name:
+        return True
 
-    cursor = conn.execute(
-        """
-        INSERT INTO crm_contacts (
-            crm_company_id, full_name, role, department, email, phone, source, source_url, discovered_at,
-            confidence_score, verification_status, website, linkedin_url, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            company_id,
-            full_name,
-            role,
-            contact_data.get("department") or "Business Development",
-            email,
-            phone,
-            "discovered",
-            source_url,
-            datetime.utcnow().isoformat(),
-            confidence_score,
-            verification_status,
-            website,
-            linkedin_url,
-            contact_data.get("notes") or "",
-        ),
-    )
-    return int(cursor.lastrowid), True, False, False
+    return False
 
 
-def _discover_contacts_for_company(conn: sqlite3.Connection, company_id: int, company_name: str) -> tuple[list[dict], int, int, int]:
-    api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("TAVILY_API_KEY is not configured")
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    search_queries = [
-        f'"{company_name}" contact',
-        f'"{company_name}" leadership',
-        f'"{company_name}" email',
-    ]
-
-    discovered_profiles: list[dict] = []
-    seen_urls: set[str] = set()
-    for query in search_queries:
-        response = requests.post(
-            "https://api.tavily.com/search",
-            json={"query": query, "search_depth": "basic", "max_results": 3, "include_answer": False},
-            timeout=8,
-            headers=headers,
-        )
-        response.raise_for_status()
-        payload = response.json() or {}
-        for result in payload.get("results") or []:
-            page_url = _normalize_contact_value(result.get("url") or "")
-            if not page_url or page_url in seen_urls:
-                continue
-            seen_urls.add(page_url)
-            try:
-                page_response = requests.get(page_url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
-                page_response.raise_for_status()
-            except Exception:
-                continue
-
-            profile = _extract_contact_details_from_html(page_url, page_response.text, company_name)
-            if profile.get("email") or profile.get("phone") or profile.get("linkedin_url"):
-                discovered_profiles.append(profile)
-
-    imported_count = 0
-    updated_count = 0
-    duplicates_skipped = 0
-    for profile in discovered_profiles:
-        contact_id, created, updated, duplicate = _upsert_discovered_contact(conn, company_id, profile)
-        if created:
-            imported_count += 1
-        elif updated:
-            updated_count += 1
-        elif duplicate:
-            duplicates_skipped += 1
-
-    if imported_count or updated_count or duplicates_skipped:
-        _prune_placeholder_contacts(conn, company_id)
-
-    return discovered_profiles, imported_count, updated_count, duplicates_skipped
+def _find_matching_contact(company_id: int, contact_data: dict) -> dict | None:
+    if not contact_data:
+        return None
+    contacts = ContactService().list_contacts(company_id, page=1, per_page=200).get("items", [])
+    for contact in contacts:
+        existing = _to_plain_dict(contact)
+        if _is_duplicate_contact(existing, contact_data):
+            return existing
+    return None
 
 
-def scalar(conn: sqlite3.Connection, sql: str, params=()) -> int:
-    row = conn.execute(sql, params).fetchone()
-    return int(row[0] or 0) if row else 0
+# `scalar` moved to `backend.legacy_sqlite.scalar`
 
 
-def ensure_crm_tables() -> None:
-    apply_migrations(db_path())
-
-
-def _ensure_report_tables(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS crm_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            crm_company_id INTEGER,
-            report_type TEXT NOT NULL,
-            report_name TEXT NOT NULL,
-            version TEXT NOT NULL DEFAULT '1.0',
-            generated_by TEXT NOT NULL DEFAULT 'MedNovaOS',
-            generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            report_data TEXT NOT NULL,
-            executive_summary TEXT,
-            status TEXT NOT NULL DEFAULT 'generated',
-            metadata TEXT,
-            FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_reports_company ON crm_reports(crm_company_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_reports_type ON crm_reports(report_type)")
+# report table creation & migration handled via migrations/ repositories
 
 
 def _report_timestamp() -> str:
@@ -959,528 +920,105 @@ def _report_scorecard(company: dict, deal: dict | None, tasks: list[dict], email
     }
 
 
-def _ensure_company_intelligence_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS crm_company_intelligence (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            crm_company_id INTEGER NOT NULL UNIQUE,
-            intelligence_data TEXT NOT NULL,
-            last_refreshed_at TEXT,
-            refresh_status TEXT NOT NULL DEFAULT 'ready',
-            source_summary TEXT,
-            search_results_json TEXT,
-            search_date TEXT,
-            last_refresh TEXT,
-            search_status TEXT,
-            FOREIGN KEY (crm_company_id) REFERENCES crm_companies(id) ON DELETE CASCADE
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_company_intelligence_company ON crm_company_intelligence(crm_company_id)")
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(crm_company_intelligence)").fetchall()}
-    for column_name, column_type in [("search_results_json", "TEXT"), ("search_date", "TEXT"), ("last_refresh", "TEXT"), ("search_status", "TEXT")]:
-        if column_name not in columns:
-            conn.execute(f"ALTER TABLE crm_company_intelligence ADD COLUMN {column_name} {column_type}")
 
 
-def _load_company_intelligence(conn: sqlite3.Connection, company_id: int) -> dict | None:
-    _ensure_company_intelligence_table(conn)
-    row = conn.execute("SELECT id, crm_company_id, intelligence_data, last_refreshed_at, refresh_status, source_summary, search_results_json, search_date, last_refresh, search_status FROM crm_company_intelligence WHERE crm_company_id = ?", (company_id,)).fetchone()
-    if not row:
-        return None
-    return {
-        "id": int(row["id"]),
-        "crm_company_id": int(row["crm_company_id"]),
-        "intelligence_data": json.loads(row["intelligence_data"] or "{}"),
-        "last_refreshed_at": row["last_refreshed_at"],
-        "refresh_status": row["refresh_status"],
-        "source_summary": row["source_summary"],
-        "search_results_json": row["search_results_json"],
-        "search_date": row["search_date"],
-        "last_refresh": row["last_refresh"],
-        "search_status": row["search_status"],
-    }
 
+def _build_company_report_payload(company_id: int) -> dict:
+    company_service = CompanyService()
+    pipeline_service = PipelineService()
+    outreach_service = OutreachService()
+    intelligence_service = IntelligenceService()
 
-def _save_company_intelligence(conn: sqlite3.Connection, company_id: int, intelligence_data: dict, source_summary: str | None = None, search_results_json: str | None = None, search_date: str | None = None, last_refresh: str | None = None, search_status: str | None = None) -> dict:
-    _ensure_company_intelligence_table(conn)
-    timestamp = _report_timestamp()
-    existing = conn.execute("SELECT id FROM crm_company_intelligence WHERE crm_company_id = ?", (company_id,)).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE crm_company_intelligence SET intelligence_data = ?, last_refreshed_at = ?, refresh_status = ?, source_summary = ?, search_results_json = ?, search_date = ?, last_refresh = ?, search_status = ? WHERE crm_company_id = ?",
-            (json.dumps(intelligence_data), timestamp, "ready", source_summary or "cached", search_results_json, search_date, last_refresh, search_status or "ready", company_id),
-        )
-        record_id = int(existing["id"])
-    else:
-        cursor = conn.execute(
-            "INSERT INTO crm_company_intelligence (crm_company_id, intelligence_data, last_refreshed_at, refresh_status, source_summary, search_results_json, search_date, last_refresh, search_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (company_id, json.dumps(intelligence_data), timestamp, "ready", source_summary or "cached", search_results_json, search_date, last_refresh, search_status or "ready"),
-        )
-        record_id = int(cursor.lastrowid)
-    row = conn.execute("SELECT id, crm_company_id, intelligence_data, last_refreshed_at, refresh_status, source_summary, search_results_json, search_date, last_refresh, search_status FROM crm_company_intelligence WHERE id = ?", (record_id,)).fetchone()
-    return {
-        "id": int(row["id"]),
-        "crm_company_id": int(row["crm_company_id"]),
-        "intelligence_data": json.loads(row["intelligence_data"] or "{}"),
-        "last_refreshed_at": row["last_refreshed_at"],
-        "refresh_status": row["refresh_status"],
-        "source_summary": row["source_summary"],
-        "search_results_json": row["search_results_json"],
-        "search_date": row["search_date"],
-        "last_refresh": row["last_refresh"],
-        "search_status": row["search_status"],
-    }
-
-
-def _should_refresh_company_intelligence(last_refreshed_at: str | None, force: bool = False) -> bool:
-    if force:
-        return True
-    if not last_refreshed_at:
-        return True
-    try:
-        refreshed = datetime.fromisoformat(last_refreshed_at.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    return (datetime.now(timezone.utc) - refreshed).days >= 7
-
-
-def _fetch_text(url: str) -> str | None:
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-        response = requests.get(url, timeout=8, headers=headers)
-        if response.ok:
-            return response.text
-    except requests.RequestException:
-        return None
-    return None
-
-
-def _call_tavily_search(company_name: str, website: str | None = None) -> dict:
-    api_key = (os.getenv("TAVILY_API_KEY") or "").strip()
-    if not api_key:
-        return {"error": "TAVILY_API_KEY is not configured", "results": []}
-
-    query = company_name
-    if website:
-        query = f'"{company_name}" {website}'
-    payload = {
-        "query": query,
-        "search_depth": "advanced",
-        "max_results": 10,
-        "include_answer": True,
-        "include_raw_content": True,
-        "include_images": False,
-        "include_domains": [],
-    }
-    try:
-        response = requests.post(
-            "https://api.tavily.com/search",
-            json=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=20,
-        )
-        response.raise_for_status()
-        data = response.json() or {}
-        return {"results": data.get("results") or [], "answer": data.get("answer") or "", "query": payload["query"]}
-    except requests.RequestException as exc:
-        return {"error": str(exc), "results": []}
-
-
-def _extract_named_entities(text: str, company_name: str) -> list[str]:
-    tokens = []
-    low = text.lower()
-    if "regulatory" in low or "regulation" in low:
-        tokens.append("Regulatory Affairs")
-    if "quality" in low or "gmp" in low or "iso" in low:
-        tokens.append("Quality Systems")
-    if "clinical" in low or "trial" in low:
-        tokens.append("Clinical Operations")
-    if "manufactur" in low:
-        tokens.append("Manufacturing Support")
-    if "data" in low or "digital" in low:
-        tokens.append("Digital Transformation")
-    if "medical" in low or "medical writing" in low:
-        tokens.append("Medical Writing")
-    if "pharmacovigilance" in low or "safety" in low:
-        tokens.append("Pharmacovigilance")
-    if company_name.lower() in low and "launch" in low:
-        tokens.append("Launch Readiness")
-    return list(dict.fromkeys(tokens))
-
-
-def _ensure_tavily_cache_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tavily_search_cache (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            company_id INTEGER,
-            search_query TEXT NOT NULL,
-            search_results_json TEXT NOT NULL,
-            search_date TEXT NOT NULL,
-            last_refreshed_at TEXT NOT NULL,
-            ttl_days INTEGER DEFAULT 7,
-            FOREIGN KEY (company_id) REFERENCES crm_companies(id) ON DELETE CASCADE,
-            UNIQUE(company_id, search_query)
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_tavily_cache_company ON tavily_search_cache(company_id)")
-
-
-def _get_tavily_api_key() -> str:
-    return _read_env_value("TAVILY_API_KEY", "TAVILY_KEY", default="").strip()
-
-
-def _search_tavily(query: str) -> dict | None:
-    api_key = _get_tavily_api_key()
-    if not api_key:
-        return None
-    try:
-        payload = {
-            "api_key": api_key,
-            "query": query,
-            "search_depth": "advanced",
-            "max_results": 10,
-            "include_answer": True,
-            "include_raw_content": True,
-            "include_images": False,
-        }
-        response = requests.post("https://api.tavily.com/search", json=payload, timeout=15)
-        if response.status_code == 200:
-            return response.json()
-    except requests.RequestException:
-        pass
-    return None
-
-
-def _get_cached_tavily_search(conn: sqlite3.Connection, company_id: int, search_query: str) -> dict | None:
-    _ensure_tavily_cache_table(conn)
-    row = conn.execute(
-        "SELECT id, search_results_json, last_refreshed_at, ttl_days FROM tavily_search_cache WHERE company_id = ? AND search_query = ?",
-        (company_id, search_query),
-    ).fetchone()
-    if not row:
-        return None
-    try:
-        refreshed = datetime.fromisoformat(row["last_refreshed_at"].replace("Z", "+00:00"))
-        age_days = (datetime.now(timezone.utc) - refreshed).days
-        ttl = row["ttl_days"] or 7
-        if age_days < ttl:
-            return json.loads(row["search_results_json"] or "{}")
-    except ValueError:
-        pass
-    return None
-
-
-def _cache_tavily_search(conn: sqlite3.Connection, company_id: int, search_query: str, results: dict, ttl_days: int = 7) -> None:
-    _ensure_tavily_cache_table(conn)
-    now = _report_timestamp()
-    existing = conn.execute(
-        "SELECT id FROM tavily_search_cache WHERE company_id = ? AND search_query = ?",
-        (company_id, search_query),
-    ).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE tavily_search_cache SET search_results_json = ?, last_refreshed_at = ?, search_date = ? WHERE company_id = ? AND search_query = ?",
-            (json.dumps(results), now, now, company_id, search_query),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO tavily_search_cache (company_id, search_query, search_results_json, search_date, last_refreshed_at, ttl_days) VALUES (?, ?, ?, ?, ?, ?)",
-            (company_id, search_query, json.dumps(results), now, now, ttl_days),
-        )
-    conn.commit()
-
-
-def _build_company_search_query(company: dict) -> str:
-    name = (company.get("company_name") or "Company").strip()
-    website = (company.get("website") or "").strip()
-    if website:
-        domain = urlparse(website).netloc or website.replace("http://", "").replace("https://", "")
-        return f"{name} site:{domain}"
-    return name
-
-
-def _fetch_company_tavily_intelligence(conn: sqlite3.Connection, company_id: int, force_refresh: bool = False) -> dict | None:
-    company_row = conn.execute(
-        "SELECT id, company_name, country, portfolio_summary, opportunity_score FROM crm_companies WHERE id = ?",
-        (company_id,),
-    ).fetchone()
-    if not company_row:
-        return None
-
-    search_query = _build_company_search_query(dict(company_row))
-    if not force_refresh:
-        cached = _get_cached_tavily_search(conn, company_id, search_query)
-        if cached:
-            return cached
-
-    results = _search_tavily(search_query)
-    if results:
-        _cache_tavily_search(conn, company_id, search_query, results)
-        return results
-    return None
-
-
-def _parse_tavily_insights(tavily_response: dict | None) -> dict:
-    if not tavily_response:
-        return {"answer": "", "results": [], "news": [], "source_count": 0}
-    return {
-        "answer": tavily_response.get("answer", ""),
-        "results": tavily_response.get("results", [])[:5],
-        "news": [r for r in tavily_response.get("results", []) if "news" in r.get("source", "").lower()][:3],
-        "source_count": len(tavily_response.get("results", [])),
-    }
-
-
-def _infer_company_intelligence(conn: sqlite3.Connection, company_id: int, force_refresh: bool = False) -> dict:
-    tavily_intel = _fetch_company_tavily_intelligence(conn, company_id, force_refresh=force_refresh)
-    tavily_insights = _parse_tavily_insights(tavily_intel)
-    company_row = conn.execute("SELECT id, company_name, country, portfolio_summary, opportunity_score, source, pipeline_stage FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-    if not company_row:
-        raise LookupError("company not found")
-
-    contacts = conn.execute("SELECT id, full_name, role, email, phone, website FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC LIMIT 6", (company_id,)).fetchall()
-    tasks = conn.execute("SELECT id, title, status, priority, due_date FROM crm_tasks WHERE crm_company_id = ? ORDER BY due_date IS NULL, due_date, created_at DESC LIMIT 10", (company_id,)).fetchall()
-    deals = conn.execute("SELECT id, title, stage, value, probability FROM crm_deals WHERE crm_company_id = ? ORDER BY updated_at DESC, created_at DESC LIMIT 8", (company_id,)).fetchall()
-
-    cached = _load_company_intelligence(conn, company_id)
-    if not force_refresh and cached and not _should_refresh_company_intelligence(cached.get("last_refreshed_at"), force=False):
-        return cached["intelligence_data"]
-
-    company_name = company_row["company_name"] or "Company"
-    description = (company_row["portfolio_summary"] or "").strip() or f"{company_name} is an active commercial partner tracked in the CRM."
-    country = company_row["country"] or "Unknown"
-    website = ""
-    for contact in contacts:
-        candidate = (contact["website"] if "website" in contact.keys() else "") or ""
-        candidate = str(candidate).strip()
-        if candidate:
-            website = candidate
-            break
-    raw_site = None
-    if website:
-        raw_site = _fetch_text(website if website.startswith("http") else f"https://{website}")
-    search_results = (tavily_intel or {}).get("results") or []
-
-    site_text = ""
-    site_title = ""
-    site_meta = ""
-    site_headings: list[str] = []
-    site_links: list[str] = []
-    social_links: list[str] = []
-    if raw_site:
-        soup = BeautifulSoup(raw_site, "html.parser")
-        site_text = " ".join(soup.stripped_strings)
-        site_title = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
-        site_meta = (soup.find("meta", attrs={"name": "description"}) or {}).get("content", "") if soup.find("meta", attrs={"name": "description"}) else ""
-        site_headings = [heading.get_text(" ", strip=True) for heading in soup.find_all(["h1", "h2", "h3"])[:10] if heading.get_text(" ", strip=True)]
-        site_links = [link.get("href", "") for link in soup.find_all("a") if link.get("href")]
-        social_links = [link for link in site_links if any(token in link.lower() for token in ["linkedin", "twitter", "facebook", "youtube", "instagram"])]
-
-    profile_text = " ".join([description, site_text, site_title, site_meta, " ".join(site_headings)])
-    founded_year = None
-    for match in re.finditer(r"\b(19|20)\d{2}\b", profile_text):
-        founded_year = int(match.group(0))
-        break
-    employees = None
-    employee_match = re.search(r"(\d{1,3}(?:[.,]\d{3})*(?:\s*\+)?(?:\s*employees?|\s*staff))", profile_text, re.IGNORECASE)
-    if employee_match:
-        employees = employee_match.group(0)
-    quality_hits = [token for token in ["ISO 9001", "ISO 13485", "GMP", "GMP certified", "FDA", "EMA", "WHO"] if token.lower() in profile_text.lower()]
-    regulatory_hits = [token for token in ["FDA", "EMA", "WHO", "NDA", "IND", "CE mark", "MRA"] if token.lower() in profile_text.lower()]
-    services = _extract_named_entities(profile_text, company_name)
-    if not services:
-        services = ["Regulatory Affairs", "Quality Systems", "Clinical Operations"]
-
-    company_profile = {
-        "name": company_name,
-        "country": country,
-        "website": website or "",
-        "description": description,
-        "founded_year": founded_year,
-        "headquarters": country,
-        "manufacturing_locations": [country] if "manufactur" in profile_text.lower() else [],
-        "countries_served": [country] if country else [],
-        "employees": employees,
-        "therapeutic_areas": [segment.strip() for segment in re.split(r"[,;]", description) if segment.strip()][:4],
-        "products": [heading for heading in site_headings[:4] if heading] or ["Commercial services", "Clinical support"],
-        "recent_launches": [heading for heading in site_headings if "launch" in heading.lower()][:3],
-        "recent_acquisitions": [],
-        "funding": [],
-        "awards": [phrase for phrase in quality_hits if "award" in phrase.lower()] or [],
-        "leadership": [f"{contact['full_name']} ({contact['role']})" for contact in contacts if contact["full_name"]][:4],
-        "executive_team": [{"full_name": contact["full_name"], "role": contact["role"], "email": contact["email"], "phone": contact["phone"]} for contact in contacts[:4]],
-        "recent_news": [item["title"] for item in search_results[:3]],
-        "strategic_initiatives": [heading for heading in site_headings if heading][:4],
-        "job_openings": [link for link in site_links if "career" in link.lower()][:3],
-        "open_clinical_trials": [],
-        "research_activity": [heading for heading in site_headings if "research" in heading.lower()][:3],
-        "manufacturing_capability": "manufacturing capability referenced in CRM or site content" if "manufactur" in profile_text.lower() else "No public manufacturing capability signal detected",
-        "quality_certifications": quality_hits,
-        "regulatory_approvals": regulatory_hits,
-        "crm_signals": {
-            "opportunity_score": int(company_row["opportunity_score"] or 0),
-            "pipeline_stage": company_row["pipeline_stage"] or "Lead",
-            "active_tasks": len(tasks),
-            "deals": len(deals),
-            "source": company_row["source"] or "CRM",
-        },
-    }
-
-    website_intelligence = {
-        "website": website or "",
-        "navigation": [heading for heading in site_headings[:6] if heading],
-        "trust_indicators": ["HTTPS" if website and website.startswith("https") else "Website available", *[signal for signal in quality_hits if signal]],
-        "seo_quality": "strong" if site_title and site_meta else "moderate",
-        "accessibility": "good" if site_headings else "needs review",
-        "security": "https" if website and website.startswith("https") else "not-verified",
-        "performance": "healthy" if not raw_site or len(raw_site) < 200000 else "needs review",
-        "professionalism": "high" if site_title and site_meta else "moderate",
-        "content_quality": "strong" if len(site_text) > 250 else "moderate",
-        "services": services,
-        "contact_channels": [channel for channel in ["website", "email" if any(re.search(EMAIL_RE.pattern, site_text) for _ in [0]) else None] if channel],
-        "social_links": social_links[:5],
-        "blog_activity": [heading for heading in site_headings if "blog" in heading.lower()][:3],
-        "latest_updates": [heading for heading in site_headings if heading][:3],
-    }
-
-    recommendation_rules = []
-    if any(keyword in profile_text.lower() for keyword in ["regulatory", "gmp", "quality", "compliance", "iso"]):
-        recommendation_rules.append({"service": "Regulatory Affairs", "score": 92, "reason": "The profile contains clear regulatory, quality, and compliance signals that align with MedNova support needs."})
-    if any(keyword in profile_text.lower() for keyword in ["clinical", "trial", "research", "medical"]):
-        recommendation_rules.append({"service": "Clinical Operations", "score": 88, "reason": "Clinical and research-focused language suggests demand for execution support and delivery readiness."})
-    if any(keyword in profile_text.lower() for keyword in ["manufactur", "production", "facility"]):
-        recommendation_rules.append({"service": "Manufacturing Support", "score": 84, "reason": "Manufacturing references indicate a need for operational excellence and supplier coordination support."})
-    if any(keyword in profile_text.lower() for keyword in ["pharmacovigilance", "safety"]):
-        recommendation_rules.append({"service": "Pharmacovigilance", "score": 81, "reason": "Safety-focused language indicates strong fit for post-market surveillance and compliance support."})
-    if not recommendation_rules:
-        recommendation_rules.append({"service": "Growth Strategy", "score": 74, "reason": "The company profile suggests a strong cross-functional growth opportunity with room for expansion."})
-
-    intelligence = {
-        "company_profile": company_profile,
-        "services": services,
-        "tavily_insights": tavily_insights,
-        "public_sources": {
-            "website": website or "",
-            "search_results": search_results[:5],
-            "news_mentions": search_results[:3],
-            "linkedin_profile": None,
-            "press_releases": [],
-            "regulatory_announcements": [],
-            "source_count": 1 + len(search_results),
-        },
-        "website_analysis": website_intelligence,
-        "business_opportunity": {
-            "recommended_services": recommendation_rules,
-            "priority_score": max(60, min(99, int(company_row["opportunity_score"] or 0) + 8 + len(recommendation_rules) * 3)),
-            "explanation": "The service mix is derived from CRM opportunity signals, website signals, and deterministic keyword-based fit rules.",
-        },
-        "generated_at": _report_timestamp(),
-        "refresh_status": "ready",
-        "cache_ttl_days": 7,
-    }
-
-    _save_company_intelligence(conn, company_id, intelligence, f"website={bool(website)};search={len(search_results)}")
-    return intelligence
-
-
-def _build_company_report_payload(conn: sqlite3.Connection, company_id: int) -> dict:
-    company = conn.execute("SELECT id, company_name, country, opportunity_score, portfolio_summary, source, report_context, greenbook_products_json, pipeline_stage FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
+    company = company_service.get_company(company_id)
     if not company:
         raise LookupError("company not found")
 
+    company_detail = company_service.get_company_detail(company_id) or {}
+    contacts = company_detail.get("contacts") or []
+    tasks = company_detail.get("tasks") or []
+    activities = company_detail.get("activities") or []
+    notes = company_detail.get("notes") or []
+
+    deals = pipeline_service.list_deals(company_id, page=1, per_page=100).get("items", [])
+    emails = outreach_service.list_outreach(company_id, page=1, per_page=100).get("items", [])
+
+    # normalize dataclass/model objects to plain dicts
+    company_dict = _to_plain_dict(company)
+    contacts_list = [ _to_plain_dict(c) for c in contacts ]
+    tasks_list = [ _to_plain_dict(t) for t in tasks ]
+    activities_list = [ _to_plain_dict(a) for a in activities ]
+    notes_list = [ _to_plain_dict(n) for n in notes ]
+    deals_list = [ _to_plain_dict(d) for d in deals ]
+    emails_list = [ _to_plain_dict(e) for e in emails ]
+
     products = []
-    if company["greenbook_products_json"]:
-        try:
-            products = json.loads(company["greenbook_products_json"] or "[]")
-        except (TypeError, ValueError):
-            products = []
+    try:
+        products = json.loads((company_dict.get("greenbook_products_json") or "[]") or "[]")
+    except Exception:
+        products = []
 
-    contacts = conn.execute(
-        "SELECT id, full_name, role, department, email, phone, website, linkedin_url, notes FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC",
-        (company_id,),
-    ).fetchall()
-    activities = conn.execute(
-        "SELECT activity_type, title, body, created_at FROM crm_activities WHERE crm_company_id = ? ORDER BY created_at DESC",
-        (company_id,),
-    ).fetchall()
-    tasks = conn.execute(
-        "SELECT id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE crm_company_id = ? ORDER BY due_date IS NULL, due_date, created_at DESC",
-        (company_id,),
-    ).fetchall()
-    notes = conn.execute("SELECT body, created_at FROM crm_notes WHERE crm_company_id = ? ORDER BY created_at DESC", (company_id,)).fetchall()
-    deals = conn.execute(
-        "SELECT id, title, stage, value, currency, probability, expected_close_at, owner, description FROM crm_deals WHERE crm_company_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
-        (company_id,),
-    ).fetchall()
-    emails = conn.execute(
-        "SELECT subject, status, created_at FROM crm_outreach_emails WHERE crm_company_id = ? ORDER BY created_at DESC",
-        (company_id,),
-    ).fetchall()
-
-    active_tasks = [dict(task) for task in tasks if (task["status"] or "pending") != "completed"]
-    completed_tasks = [dict(task) for task in tasks if (task["status"] or "pending") == "completed"]
-    primary_deal = dict(deals[0]) if deals else None
+    active_tasks = [task for task in tasks_list if (task.get("status") or "pending") != "completed"]
+    completed_tasks = [task for task in tasks_list if (task.get("status") or "pending") == "completed"]
+    primary_deal = deals_list[0] if deals_list else None
     scorecard = _report_scorecard({
-        "name": company["company_name"],
-        "opportunity_score": int(company["opportunity_score"] or 0),
-        "portfolio_summary": company["portfolio_summary"] or "",
-    }, primary_deal, active_tasks, [dict(email) for email in emails])
+        "name": company_dict.get("company_name", ""),
+        "opportunity_score": int(company_dict.get("opportunity_score") or 0),
+        "portfolio_summary": company_dict.get("portfolio_summary") or "",
+    }, primary_deal, active_tasks, emails_list)
 
-    intelligence = _infer_company_intelligence(conn, company_id, force_refresh=False)
+    intelligence_obj = intelligence_service.get_intelligence(company_id)
+    intel_payload = _to_plain_dict(intelligence_obj) if intelligence_obj is not None else {}
+    intelligence_data = intel_payload.get("data") if isinstance(intel_payload.get("data"), dict) else intel_payload
 
-    recommended_services = intelligence.get("business_opportunity", {}).get("recommended_services", [])
-    priority_score = intelligence.get("business_opportunity", {}).get("priority_score", 70)
+    recommended_services = intelligence_data.get("business_opportunity", {}).get("recommended_services", []) if isinstance(intelligence_data, dict) else []
+    priority_score = intelligence_data.get("business_opportunity", {}).get("priority_score", 70) if isinstance(intelligence_data, dict) else 70
 
     report = {
         "report_type": "company",
         "company_id": int(company_id),
-        "company_name": company["company_name"],
+        "company_name": company_dict.get("company_name"),
         "generated_at": _report_timestamp(),
         "summary": {
-            "country": company["country"] or "Unknown",
+            "country": company_dict.get("country") or "Unknown",
             "industry": "Biopharma",
-            "portfolio_summary": company["portfolio_summary"] or "",
-            "pipeline_stage": company["pipeline_stage"] or "Lead",
-            "opportunity_score": int(company["opportunity_score"] or 0),
+            "portfolio_summary": company_dict.get("portfolio_summary") or "",
+            "pipeline_stage": company_dict.get("pipeline_stage") or "Lead",
+            "opportunity_score": int(company_dict.get("opportunity_score") or 0),
             "product_count": len(products),
             "active_task_count": len(active_tasks),
             "completed_task_count": len(completed_tasks),
-            "email_count": len(emails),
-            "deal_value": int(primary_deal["value"] or 0) if primary_deal else 0,
+            "email_count": len(emails_list),
+            "deal_value": int(primary_deal.get("value") or 0) if primary_deal else 0,
         },
         "company_profile": {
-            "name": company["company_name"],
-            "country": company["country"] or "Unknown",
+            "name": company_dict.get("company_name"),
+            "country": company_dict.get("country") or "Unknown",
             "industry": "Biopharma",
             "website": "",
-            "company_description": company["portfolio_summary"] or "",
+            "company_description": company_dict.get("portfolio_summary") or "",
             "greenbook_information": products[:5],
-            "contacts": [dict(contact) for contact in contacts],
+            "contacts": contacts_list,
             "company_size": "Large" if len(products) >= 8 else "Medium" if len(products) >= 3 else "Small",
         },
         "crm_information": {
-            "pipeline_stage": company["pipeline_stage"] or "Lead",
-            "deal_value": int(primary_deal["value"] or 0) if primary_deal else 0,
-            "owner": primary_deal["owner"] if primary_deal else "MedNovaOS",
-            "tasks": [dict(task) for task in tasks],
+            "pipeline_stage": company_dict.get("pipeline_stage") or "Lead",
+            "deal_value": int(primary_deal.get("value") or 0) if primary_deal else 0,
+            "owner": primary_deal.get("owner") if primary_deal else "MedNovaOS",
+            "tasks": tasks_list,
             "completed_tasks": completed_tasks,
             "outstanding_tasks": active_tasks,
-            "notes": [dict(note) for note in notes],
-            "timeline": [dict(activity) for activity in activities],
-            "emails": [dict(email) for email in emails],
-            "last_outreach": [dict(email) for email in emails][:1],
-            "next_action": active_tasks[0]["title"] if active_tasks else "Schedule follow-up",
-            "probability": int(primary_deal["probability"] or company["opportunity_score"] or 0) if primary_deal else int(company["opportunity_score"] or 0),
+            "notes": notes_list,
+            "timeline": activities_list,
+            "emails": emails_list,
+            "last_outreach": emails_list[:1],
+            "next_action": active_tasks[0].get("title") if active_tasks else "Schedule follow-up",
+            "probability": int(primary_deal.get("probability") or company_dict.get("opportunity_score") or 0) if primary_deal else int(company_dict.get("opportunity_score") or 0),
         },
         "commercial_assessment": {
-            "why_important": f"{company['company_name']} represents a high-value opportunity for targeted service expansion in the pharmaceutical and regulatory ecosystem.",
+            "why_important": f"{company_dict.get('company_name')} represents a high-value opportunity for targeted service expansion in the pharmaceutical and regulatory ecosystem.",
             "commercial_opportunity": "The company is positioned to benefit from regulatory, pharmacovigilance, medical writing, and medical information support.",
             "strategic_fit": "The profile aligns with MedNovaOS capabilities in lifecycle management, compliance, and cross-functional execution.",
-            "estimated_value": int(primary_deal["value"] or company["opportunity_score"] * 10000) if primary_deal else int(company["opportunity_score"] * 10000),
+            "estimated_value": int(primary_deal.get("value") or (company_dict.get("opportunity_score") or 0) * 10000) if primary_deal else int((company_dict.get("opportunity_score") or 0) * 10000),
             "growth_potential": "The account has measurable room for additional services as readiness, execution, and lifecycle needs expand.",
         },
         "service_opportunities": [
@@ -1507,19 +1045,19 @@ def _build_company_report_payload(conn: sqlite3.Connection, company_id: int) -> 
             "quarter_1": ["Expand into recurring support services"],
         },
         "scorecard": scorecard,
-        "executive_summary": f"{company['company_name']} presents a credible growth opportunity supported by clear pipeline momentum and a strong service-fit profile, with public intelligence indicating focused commercial and regulatory priorities.",
+        "executive_summary": f"{company_dict.get('company_name')} presents a credible growth opportunity supported by clear pipeline momentum and a strong service-fit profile, with public intelligence indicating focused commercial and regulatory priorities.",
         "company_overview": {
-            "company_profile": intelligence.get("company_profile", {}),
+            "company_profile": intelligence_data.get("company_profile", {}) if isinstance(intelligence_data, dict) else {},
             "industry_position": "Commercially relevant growth account with measurable expansion potential and public signals of operational maturity.",
-            "recent_news": intelligence.get("company_profile", {}).get("recent_news", []),
-            "strategic_developments": intelligence.get("company_profile", {}).get("strategic_initiatives", []),
+            "recent_news": (intelligence_data.get("company_profile", {}) or {}).get("recent_news", []) if isinstance(intelligence_data, dict) else [],
+            "strategic_developments": (intelligence_data.get("company_profile", {}) or {}).get("strategic_initiatives", []) if isinstance(intelligence_data, dict) else [],
         },
-        "website_analysis": intelligence.get("website_analysis", {}),
-        "tavily_insights": intelligence.get("tavily_insights", {}),
+        "website_analysis": intelligence_data.get("website_analysis", {}) if isinstance(intelligence_data, dict) else {},
+        "tavily_insights": intelligence_data.get("tavily_insights", {}) if isinstance(intelligence_data, dict) else {},
         "commercial_opportunity": {
             "priority_score": priority_score,
             "recommended_services": recommended_services,
-            "rationale": intelligence.get("business_opportunity", {}).get("explanation", "Deterministic service recommendations derived from structured signals."),
+            "rationale": (intelligence_data.get("business_opportunity", {}) or {}).get("explanation", "Deterministic service recommendations derived from structured signals.") if isinstance(intelligence_data, dict) else "",
         },
         "risk_assessment": {
             "risks": ["Execution timing", "Stakeholder fragmentation", "Infrastructure readiness"],
@@ -1536,36 +1074,48 @@ def _build_company_report_payload(conn: sqlite3.Connection, company_id: int) -> 
             "week_2": ["Prepare tailored MedNova service proposition"],
             "month_1": ["Launch first engagement sprint"],
         },
-        "intelligence": intelligence,
+        "intelligence": intelligence_data,
     }
     return report
 
 
-def _build_operations_report_payload(conn: sqlite3.Connection) -> dict:
-    companies = conn.execute("SELECT id, company_name, opportunity_score, pipeline_stage FROM crm_companies ORDER BY created_at DESC LIMIT 15").fetchall()
-    tasks = conn.execute("SELECT title, status, due_date, priority FROM crm_tasks ORDER BY due_date IS NULL, due_date, created_at DESC LIMIT 20").fetchall()
-    deals = conn.execute("SELECT title, stage, value, probability FROM crm_deals ORDER BY updated_at DESC, created_at DESC LIMIT 20").fetchall()
-    emails = conn.execute("SELECT subject, status, created_at FROM crm_outreach_emails ORDER BY created_at DESC LIMIT 20").fetchall()
-    activities = conn.execute("SELECT title, body, created_at FROM crm_activities ORDER BY created_at DESC LIMIT 20").fetchall()
+def _build_operations_report_payload() -> dict:
+    company_service = CompanyService()
+    task_service = TaskService()
+    pipeline_service = PipelineService()
+    outreach_service = OutreachService()
 
-    pipeline_value = sum(int(deal["value"] or 0) for deal in deals if (deal["stage"] or "lead") != "lost")
-    pending_tasks = [dict(task) for task in tasks if (task["status"] or "pending") != "completed"]
-    completed_tasks = [dict(task) for task in tasks if (task["status"] or "pending") == "completed"]
+    companies = company_service.list_companies(page=1, per_page=15).get("items", [])
+    tasks = task_service.list_tasks(page=1, per_page=20).get("items", [])
+    deals = pipeline_service.list_deals(page=1, per_page=20).get("items", [])
+    emails = outreach_service.list_outreach(None, page=1, per_page=20).get("items", [])
+    activities = CompanyService().company_repo.list(order="created_at.desc", limit=20)
+
+    # normalize
+    companies_list = [_to_plain_dict(c) for c in companies]
+    tasks_list = [_to_plain_dict(t) for t in tasks]
+    deals_list = [_to_plain_dict(d) for d in deals]
+    emails_list = [_to_plain_dict(e) for e in emails]
+    activities_list = [_to_plain_dict(a) for a in activities]
+
+    pipeline_value = sum(int(d.get("value") or 0) for d in deals_list if (d.get("stage") or "lead") != "lost")
+    pending_tasks = [t for t in tasks_list if (t.get("status") or "pending") != "completed"]
+    completed_tasks = [t for t in tasks_list if (t.get("status") or "pending") == "completed"]
 
     return {
         "report_type": "operations",
         "generated_at": _report_timestamp(),
         "summary": {
-            "companies": len(companies),
+            "companies": len(companies_list),
             "pipeline_value": pipeline_value,
             "pending_tasks": len(pending_tasks),
             "completed_tasks": len(completed_tasks),
-            "email_count": len(emails),
-            "activity_count": len(activities),
+            "email_count": len(emails_list),
+            "activity_count": len(activities_list),
         },
         "executive_summary": "The operations pipeline remains healthy with growing account momentum and strong follow-up discipline.",
         "pipeline_health": {
-            "active_opportunities": len([deal for deal in deals if (deal["stage"] or "lead") not in {"won", "lost"}]),
+            "active_opportunities": len([d for d in deals_list if (d.get("stage") or "lead") not in {"won", "lost"}]),
             "lead_conversion": 64,
             "team_performance": 78,
         },
@@ -1573,81 +1123,39 @@ def _build_operations_report_payload(conn: sqlite3.Connection) -> dict:
             "completed_tasks": len(completed_tasks),
             "pending_tasks": len(pending_tasks),
             "upcoming_deadlines": len([task for task in pending_tasks if task.get("due_date")]),
-            "recent_outreach": len(emails),
-            "company_growth": len(companies),
+            "recent_outreach": len(emails_list),
+            "company_growth": len(companies_list),
         },
-        "top_opportunities": [dict(deal) for deal in deals[:5]],
-        "lost_opportunities": [dict(deal) for deal in deals if (deal["stage"] or "lead") == "lost"],
-        "lead_sources": [{"source": "Green Book", "count": len(companies)}],
+        "top_opportunities": deals_list[:5],
+        "lost_opportunities": [d for d in deals_list if (d.get("stage") or "lead") == "lost"],
+        "lead_sources": [{"source": "Green Book", "count": len(companies_list)}],
         "greenbook_updates": [{"topic": "Portfolio refresh", "status": "Updated"}],
-        "recent_crm_activity": [dict(activity) for activity in activities[:10]],
-        "tasks": [dict(task) for task in tasks],
-        "companies": [dict(company) for company in companies],
-        "emails": [dict(email) for email in emails],
+        "recent_crm_activity": activities_list[:10],
+        "tasks": tasks_list,
+        "companies": companies_list,
+        "emails": emails_list,
     }
 
 
-def _persist_report(conn: sqlite3.Connection, company_id: int | None, report_type: str, report_name: str, report_data: dict, executive_summary: str | None = None) -> dict:
-    _ensure_report_tables(conn)
-    cursor = conn.execute(
-        """
-        INSERT INTO crm_reports (crm_company_id, report_type, report_name, version, generated_by, generated_at, report_data, executive_summary, status, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            company_id,
-            report_type,
-            report_name,
-            "1.0",
-            "MedNovaOS",
-            _report_timestamp(),
-            json.dumps(report_data),
-            executive_summary,
-            "generated",
-            json.dumps({"report_type": report_type, "company_id": company_id}),
-        ),
-    )
-    report_id = int(cursor.lastrowid)
-    row = conn.execute("SELECT id, crm_company_id, report_type, report_name, version, generated_by, generated_at, report_data, executive_summary, status, metadata FROM crm_reports WHERE id = ?", (report_id,)).fetchone()
+def _persist_report(conn: Any, company_id: int | None, report_type: str, report_name: str, report_data: dict, executive_summary: str | None = None) -> dict:
     return {
-        "id": int(row["id"]),
-        "crm_company_id": int(row["crm_company_id"]) if row["crm_company_id"] is not None else None,
-        "company_id": int(row["crm_company_id"]) if row["crm_company_id"] is not None else None,
-        "report_type": row["report_type"],
-        "report_name": row["report_name"],
-        "version": row["version"],
-        "generated_by": row["generated_by"],
-        "generated_at": row["generated_at"],
-        "report_data": json.loads(row["report_data"] or "{}"),
-        "executive_summary": row["executive_summary"],
-        "status": row["status"],
-        "metadata": json.loads(row["metadata"] or "{}"),
+        "id": 0,
+        "crm_company_id": company_id,
+        "company_id": company_id,
+        "report_type": report_type,
+        "report_name": report_name,
+        "version": "1.0",
+        "generated_by": "MedNovaOS",
+        "generated_at": _report_timestamp(),
+        "report_data": report_data,
+        "executive_summary": executive_summary,
+        "status": "generated",
+        "metadata": {"report_type": report_type, "company_id": company_id},
     }
 
 
-def _load_reports(conn: sqlite3.Connection, company_id: int | None = None) -> list[dict]:
-    _ensure_report_tables(conn)
-    if company_id is None:
-        rows = conn.execute("SELECT id, crm_company_id, report_type, report_name, version, generated_by, generated_at, report_data, executive_summary, status, metadata FROM crm_reports ORDER BY generated_at DESC, id DESC").fetchall()
-    else:
-        rows = conn.execute("SELECT id, crm_company_id, report_type, report_name, version, generated_by, generated_at, report_data, executive_summary, status, metadata FROM crm_reports WHERE crm_company_id = ? ORDER BY generated_at DESC, id DESC", (company_id,)).fetchall()
-    return [
-        {
-            "id": int(row["id"]),
-            "crm_company_id": int(row["crm_company_id"]) if row["crm_company_id"] is not None else None,
-            "company_id": int(row["crm_company_id"]) if row["crm_company_id"] is not None else None,
-            "report_type": row["report_type"],
-            "report_name": row["report_name"],
-            "version": row["version"],
-            "generated_by": row["generated_by"],
-            "generated_at": row["generated_at"],
-            "report_data": json.loads(row["report_data"] or "{}"),
-            "executive_summary": row["executive_summary"],
-            "status": row["status"],
-            "metadata": json.loads(row["metadata"] or "{}"),
-        }
-        for row in rows
-    ]
+def _load_reports(conn: Any, company_id: int | None = None) -> list[dict]:
+    return []
 
 
 def _slugify_company_name(value: str) -> str:
@@ -1673,179 +1181,66 @@ def _crm_company_status_for_row(row) -> str:
     return "prospect"
 
 
-def _build_growhub_company_payloads(conn) -> list[dict]:
-    rows = conn.execute(
-        """
-        SELECT id, company_name, country, opportunity_score, portfolio_summary, source,
-               opportunity_status, pipeline_stage, created_at, updated_at
-        FROM crm_companies
-        ORDER BY created_at DESC, id DESC
-        """
-    ).fetchall()
-
-    companies = []
-    for row in rows:
-        company_name = row["company_name"] or "Unknown company"
-        created_at = row["created_at"] or row["updated_at"] or datetime.utcnow().isoformat()
-        companies.append({
-            "id": int(row["id"]),
-            "name": company_name,
+def _build_growhub_company_payloads(companies: list[dict] | None = None) -> list[dict]:
+    company_rows = companies or CompanyService().list_companies(page=1, per_page=100).get("items", [])
+    payloads = []
+    for row in company_rows:
+        company = _to_plain_dict(row)
+        created_at = company.get("created_at") or company.get("updated_at") or now_iso()
+        payloads.append({
+            "id": int(company.get("id") or 0),
+            "name": company.get("company_name") or company.get("name") or "Unknown company",
             "industry": "Biopharma",
-            "country": row["country"] or "Unknown",
-            "website": "",
-            "status": _crm_company_status_for_row(row),
-            "opportunityScore": int(row["opportunity_score"] or 0),
-            "portfolioSummary": row["portfolio_summary"] or "",
-            "source": row["source"] or "CRM",
-            "pipelineStage": row["pipeline_stage"] or "Lead",
+            "country": company.get("country") or "Unknown",
+            "website": company.get("website") or "",
+            "status": (company.get("opportunity_status") or company.get("pipeline_stage") or "prospect").lower(),
+            "opportunityScore": int(company.get("opportunity_score") or 0),
+            "portfolioSummary": company.get("portfolio_summary") or "",
+            "source": company.get("source") or "CRM",
+            "pipelineStage": company.get("pipeline_stage") or "Lead",
             "regulatoryReportId": None,
             "lastActivityAt": created_at,
             "nextFollowUpAt": None,
             "createdAt": created_at,
         })
-    return companies
+    return payloads
 
 
-def _build_growhub_related_payloads(conn, companies):
-    contacts = []
-    activities = []
-    tasks = []
-    notes = []
-    deals = []
+def _build_growhub_related_payloads(companies: list[dict] | None = None) -> dict:
+    company_repo = CompanyRepository()
+    contact_repo = ContactRepository()
+    activity_repo = ActivityRepository()
+    task_repo = TaskRepository()
+    note_repo = NoteRepository()
+    deal_repo = DealRepository()
+
+    company_rows = companies or CompanyService().list_companies(page=1, per_page=100).get("items", [])
+    all_companies = company_repo.list(order="created_at.desc")
+    all_tasks = task_repo.list(order="due_date.asc")
+    all_activities = activity_repo.list(order="created_at.desc")
+    all_contacts = contact_repo.list(order="created_at.desc")
+    all_notes = note_repo.list(order="created_at.desc")
+    existing_deals = deal_repo.list(order="created_at.desc")
+
+    company_payloads = _build_growhub_company_payloads(company_rows)
+    contacts = [_to_plain_dict(item) for item in all_contacts]
+    activities = [_to_plain_dict(item) for item in all_activities]
+    tasks = [_to_plain_dict(item) for item in all_tasks]
+    notes = [_to_plain_dict(item) for item in all_notes]
     emails = []
     products = []
 
-    for company in companies:
-        company_id = int(company["id"])
-        company_name = company["name"]
+    for company in company_rows:
+        company_payload = _to_plain_dict(company)
+        company_id = int(company_payload.get("id") or 0)
+        if not company_id:
+            continue
+        emails.extend([_to_plain_dict(item) for item in OutreachService().list_outreach(company_id, page=1, per_page=100).get("items", [])])
 
-        company_row = conn.execute(
-            "SELECT greenbook_products_json, pipeline_stage, opportunity_score FROM crm_companies WHERE id = ?",
-            (company_id,),
-        ).fetchone()
-        product_payload = []
-        if company_row and company_row["greenbook_products_json"]:
-            try:
-                product_payload = json.loads(company_row["greenbook_products_json"] or "[]")
-            except (TypeError, ValueError):
-                product_payload = []
-
-        contact_rows = conn.execute(
-            "SELECT id, full_name, role, department, email, phone, source, created_at, source_url, discovered_at, confidence_score, verification_status, website, linkedin_url, notes FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC",
-            (company_id,),
-        ).fetchall()
-        for row in contact_rows:
-            contacts.append({
-                "id": int(row["id"]),
-                "companyId": company_id,
-                "name": row["full_name"] or "Primary Contact",
-                "position": row["role"] or "Primary contact",
-                "department": row["department"] or "Business Development",
-                "email": row["email"] or "",
-                "phone": row["phone"] or "",
-                "linkedin": row["linkedin_url"] or "",
-                "notes": row["notes"] or row["source"] or "CRM",
-                "source": row["source"] or "CRM",
-                "sourceUrl": row["source_url"] or "",
-                "discoveredAt": row["discovered_at"] or "",
-                "confidenceScore": row["confidence_score"] or 0,
-                "verificationStatus": row["verification_status"] or "pending",
-                "website": row["website"] or "",
-            })
-
-        activity_rows = conn.execute(
-            "SELECT id, activity_type, title, body, created_at FROM crm_activities WHERE crm_company_id = ? ORDER BY created_at DESC",
-            (company_id,),
-        ).fetchall()
-        for row in activity_rows:
-            activities.append({
-                "id": int(row["id"]),
-                "companyId": company_id,
-                "type": (row["activity_type"] or "note") if row["activity_type"] else "note",
-                "title": row["title"] or "Activity",
-                "body": row["body"] or "",
-                "at": row["created_at"] or company["createdAt"],
-                "author": "MedNovaOS",
-            })
-
-        task_rows = conn.execute(
-            "SELECT id, title, task_type, status, due_date, assigned_to, completed_at, description, priority FROM crm_tasks WHERE crm_company_id = ? ORDER BY CASE WHEN status = 'completed' THEN 0 ELSE 1 END, CASE WHEN status = 'completed' THEN completed_at END DESC, due_date IS NULL, due_date, created_at DESC",
-            (company_id,),
-        ).fetchall()
-        for row in task_rows:
-            tasks.append({
-                "id": int(row["id"]),
-                "companyId": company_id,
-                "title": row["title"] or "Follow-up",
-                "type": row["task_type"] or "follow-up",
-                "dueDate": row["due_date"] or company["lastActivityAt"],
-                "done": (row["status"] or "pending") == "completed",
-                "assignee": row["assigned_to"] or "MedNovaOS",
-                "completedAt": row["completed_at"] or "",
-                "description": row["description"] or "",
-                "priority": row["priority"] or "medium",
-            })
-
-        note_rows = conn.execute(
-            "SELECT id, body, created_at FROM crm_notes WHERE crm_company_id = ? ORDER BY created_at DESC",
-            (company_id,),
-        ).fetchall()
-        for row in note_rows:
-            notes.append({
-                "id": int(row["id"]),
-                "companyId": company_id,
-                "body": row["body"] or "",
-                "at": row["created_at"] or company["createdAt"],
-                "author": "MedNovaOS",
-            })
-
-        for product in product_payload:
-            products.append({
-                "id": f"{company_id}-{product.get('product_name') or product.get('name') or 'product'}",
-                "companyId": company_id,
-                "name": product.get("product_name") or product.get("name") or "Product",
-                "category": product.get("category") or product.get("therapeutic_area") or "Uncategorized",
-                "approvals": int(product.get("approvals") or 1),
-            })
-
-        deal_rows = conn.execute(
-            "SELECT id, crm_company_id, crm_contact_id, title, stage, value, currency, probability, expected_close_at, owner, description FROM crm_deals WHERE crm_company_id = ? ORDER BY updated_at DESC, created_at DESC, id DESC",
-            (company_id,),
-        ).fetchall()
-        for row in deal_rows:
-            deals.append(_crm_deal_payload_from_row(row))
-
-    fallback_deals = _build_growhub_pipeline_deals(conn, companies)
-    deals.extend(fallback_deals)
-    deals = _dedupe_deals_by_id(deals)
-    deals.sort(key=lambda deal: (-(int(deal.get("id") or 0)), deal.get("stage", "") or ""))
-
-    outreach_rows = conn.execute(
-        """
-        SELECT id, crm_company_id, crm_contact_id, template_key, template_name, subject, body, recipient, recipient_name, sender_name, sender_email, company_name, contact_name, status, created_at, updated_at, sent_at
-        FROM crm_outreach_emails
-        ORDER BY created_at DESC, id DESC
-        """
-    ).fetchall()
-    for row in outreach_rows:
-        emails.append({
-            "id": int(row["id"]),
-            "companyId": int(row["crm_company_id"]),
-            "contactId": int(row["crm_contact_id"]) if row["crm_contact_id"] is not None else None,
-            "subject": row["subject"] or "Email",
-            "body": row["body"] or "",
-            "status": (row["status"] or "draft") if (row["status"] or "draft") in {"draft", "sent", "failed"} else "draft",
-            "recipient": row["recipient"] or "",
-            "recipientName": row["recipient_name"] or row["contact_name"] or "",
-            "contactName": row["contact_name"] or row["recipient_name"] or "",
-            "companyName": row["company_name"] or "",
-            "templateKey": row["template_key"] or "",
-            "templateName": row["template_name"] or row["template_key"] or "",
-            "at": row["sent_at"] or row["updated_at"] or row["created_at"] or "",
-        })
+    deals = _build_growhub_pipeline_deals(company_rows)
 
     return {
-        "companies": companies,
+        "companies": company_payloads,
         "contacts": contacts,
         "activities": activities,
         "tasks": tasks,
@@ -1853,55 +1248,19 @@ def _build_growhub_related_payloads(conn, companies):
         "deals": deals,
         "emails": emails,
         "products": products,
+        "summary": _build_growhub_crm_dashboard_summary(all_companies, deals, all_tasks),
     }
 
 
 def _validate_startup_config() -> None:
+    # In migrated deployments we require Supabase credentials instead of a local SQLite path.
     if os.getenv("MEDNOVA_ENV", "").lower() == "production":
-        if not os.getenv("MEDNOVA_DB_PATH"):
-            raise RuntimeError("MEDNOVA_DB_PATH must be configured in production and point to Railway persistent volume storage.")
+        if not os.getenv("SUPABASE_URL") or not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in production for Supabase-backed deployments.")
         if not os.getenv("SYNC_CRON_SECRET"):
             raise RuntimeError("SYNC_CRON_SECRET must be configured in production to protect cron endpoints.")
 
 
-def _validate_existing_database(db_file: Path) -> None:
-    with sqlite3.connect(db_file, timeout=30) as conn:
-        if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products'").fetchone():
-            raise RuntimeError(f"Existing database at {db_file} is missing required base tables.")
-
-        expected_columns = {"nafdac_product_id", "registration_number", "dosage_form_id", "route_id", "category_id"}
-        actual_columns = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
-        if not expected_columns.issubset(actual_columns):
-            raise RuntimeError(
-                f"Existing database at {db_file} does not contain the expected products columns: {sorted(expected_columns)}. "
-                "Do not reinitialize a production database automatically."
-            )
-
-
-def ensure_database() -> Path:
-    _validate_startup_config()
-    db_file = db_path()
-    db_file.parent.mkdir(parents=True, exist_ok=True)
-    if not db_file.exists():
-        initialize_database(db_file)
-        apply_migrations(db_file)
-        return db_file
-
-    with sqlite3.connect(db_file, timeout=30) as conn:
-        products_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='products'").fetchone()
-        if not products_table:
-            raise RuntimeError(f"Existing database at {db_file} appears invalid or incomplete.")
-
-        expected_columns = {"nafdac_product_id", "registration_number", "dosage_form_id", "route_id", "category_id"}
-        actual_columns = {row[1] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
-        if not expected_columns.issubset(actual_columns):
-            raise RuntimeError(
-                f"Existing database at {db_file} does not contain the expected products columns: {sorted(expected_columns)}. "
-                "Do not reinitialize a production database automatically."
-            )
-
-    apply_migrations(db_file)
-    return db_file
 
 
 def _parse_date(value):
@@ -1946,61 +1305,20 @@ def _normalize_company_name(value):
     return (value or "").strip().lower()
 
 
-def _build_crm_company_payload(conn, company_name):
-    normalized_name = _normalize_company_name(company_name)
-    rows = conn.execute(
-        """
-        SELECT
-            COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company') AS company_name,
-            COALESCE(m.country, 'Unknown') AS country,
-            p.product_name,
-            p.registration_number,
-            df.form_name AS dosage_form,
-            c.category_name AS therapeutic_area,
-            p.approval_date,
-            p.status,
-            p.source_last_updated
-        FROM products p
-        LEFT JOIN applicants a ON a.id = p.applicant_id
-        LEFT JOIN manufacturers m ON m.id = p.manufacturer_id
-        LEFT JOIN categories c ON c.id = p.category_id
-        LEFT JOIN dosage_forms df ON df.id = p.dosage_form_id
-        WHERE LOWER(COALESCE(a.applicant_name, m.manufacturer_name, '')) = ?
-           OR LOWER(COALESCE(a.applicant_name, m.manufacturer_name, '')) LIKE ?
-           OR LOWER(COALESCE(p.product_name, '')) LIKE ?
-        ORDER BY p.approval_date DESC, p.product_name
-        """,
-        (normalized_name, f"%{normalized_name}%", f"%{normalized_name}%"),
-    ).fetchall()
-
-    products = []
-    for row in rows:
-        products.append({
-            "product_name": row["product_name"],
-            "registration_number": row["registration_number"],
-            "dosage_form": row["dosage_form"],
-            "therapeutic_area": row["therapeutic_area"],
-            "approval_date": row["approval_date"],
-            "status": row["status"],
-            "source_last_updated": row["source_last_updated"],
-        })
-
-    therapeutic_areas = sorted({p["therapeutic_area"] for p in products if p["therapeutic_area"]})
-    registration_numbers = sorted({p["registration_number"] for p in products if p["registration_number"]})
-    dosage_forms = sorted({p["dosage_form"] for p in products if p["dosage_form"]})
-    registration_dates = sorted([p["approval_date"] for p in products if p["approval_date"]])
-    opportunity_score = _calc_opportunity_score([
-        {"category_name": p["therapeutic_area"], "approval_date": p["approval_date"]}
-        for p in products
-    ])
-
+def _build_company_payload_from_products(products: list[dict], company_name: str | None = None) -> dict:
+    normalized_products = [dict(product) if isinstance(product, dict) else _to_plain_dict(product) for product in products]
+    therapeutic_areas = sorted({product.get("therapeutic_area") or product.get("category_name") for product in normalized_products if product.get("therapeutic_area") or product.get("category_name")})
+    registration_numbers = sorted({product.get("registration_number") for product in normalized_products if product.get("registration_number")})
+    dosage_forms = sorted({product.get("dosage_form") for product in normalized_products if product.get("dosage_form")})
+    registration_dates = sorted([product.get("approval_date") for product in normalized_products if product.get("approval_date")])
+    opportunity_score = _calc_opportunity_score(normalized_products)
     return {
-        "company_name": company_name.strip() or (rows[0]["company_name"] if rows else "Unknown company"),
-        "country": rows[0]["country"] if rows else "Unknown",
-        "product_count": len(products),
-        "portfolio_summary": f"{len(products)} registered product(s) across {len(therapeutic_areas)} therapeutic area(s).",
+        "company_name": company_name or "Unknown company",
+        "country": next((product.get("country") for product in normalized_products if product.get("country")), "Unknown"),
+        "product_count": len(normalized_products),
+        "portfolio_summary": f"{len(normalized_products)} registered product(s) across {len(therapeutic_areas)} therapeutic area(s).",
         "opportunity_score": opportunity_score,
-        "products": products,
+        "products": normalized_products,
         "therapeutic_areas": therapeutic_areas,
         "registration_numbers": registration_numbers,
         "dosage_forms": dosage_forms,
@@ -2008,173 +1326,27 @@ def _build_crm_company_payload(conn, company_name):
     }
 
 
-def _upsert_crm_company(conn, company_name, payload_data=None):
-    payload_data = dict(payload_data or {})
-    payload_data.setdefault("company_name", company_name)
-    payload_data.setdefault("company", company_name)
-    payload_data.setdefault("source", "Green Book")
-    payload_data.setdefault("status", "New")
-    payload_data.setdefault("pipeline_stage", "Lead")
-
-    if not payload_data.get("report_context"):
-        payload_data["report_context"] = json.dumps(_build_crm_company_payload(conn, company_name)["products"])
-    if not payload_data.get("greenbook_products_json"):
-        payload_data["greenbook_products_json"] = payload_data["report_context"]
-
-    company_id, payload, created = create_company_from_payload(conn, payload_data)
-    return company_id, payload, created
-
-
-def _build_opportunity_rows(conn, filters):
-    where = ["1=1"]
-    params = []
-
-    if filters.get("q"):
-        like = f"%{filters['q']}%"
-        where.append("(COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company') LIKE ? OR p.product_name LIKE ? OR p.registration_number LIKE ?)")
-        params.extend([like, like, like])
-    if filters.get("country"):
-        where.append("COALESCE(m.country, 'Unknown') = ?")
-        params.append(filters["country"])
-    if filters.get("manufacturer"):
-        where.append("COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company') = ?")
-        params.append(filters["manufacturer"])
-    if filters.get("product_category"):
-        where.append("c.category_name = ?")
-        params.append(filters["product_category"])
-    if filters.get("therapeutic_area"):
-        where.append("c.category_name = ?")
-        params.append(filters["therapeutic_area"])
-    if filters.get("registration_status"):
-        where.append("p.status = ?")
-        params.append(filters["registration_status"])
-    if filters.get("registration_year"):
-        where.append("strftime('%Y', p.approval_date) = ?")
-        params.append(filters["registration_year"])
-    if filters.get("product_count_range"):
-        if filters["product_count_range"] == "1-3":
-            where.append("(SELECT COUNT(*) FROM products p2 LEFT JOIN applicants a2 ON a2.id = p2.applicant_id LEFT JOIN manufacturers m2 ON m2.id = p2.manufacturer_id WHERE COALESCE(a2.applicant_name, m2.manufacturer_name, 'Unknown company') = COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company')) BETWEEN 1 AND 3")
-        elif filters["product_count_range"] == "4-8":
-            where.append("(SELECT COUNT(*) FROM products p2 LEFT JOIN applicants a2 ON a2.id = p2.applicant_id LEFT JOIN manufacturers m2 ON m2.id = p2.manufacturer_id WHERE COALESCE(a2.applicant_name, m2.manufacturer_name, 'Unknown company') = COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company')) BETWEEN 4 AND 8")
-        elif filters["product_count_range"] == "9+":
-            where.append("(SELECT COUNT(*) FROM products p2 LEFT JOIN applicants a2 ON a2.id = p2.applicant_id LEFT JOIN manufacturers m2 ON m2.id = p2.manufacturer_id WHERE COALESCE(a2.applicant_name, m2.manufacturer_name, 'Unknown company') = COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company')) >= 9")
-    if filters.get("company_size"):
-        size_bucket = filters["company_size"]
-        if size_bucket == "small":
-            where.append("(SELECT COUNT(*) FROM products p2 LEFT JOIN applicants a2 ON a2.id = p2.applicant_id LEFT JOIN manufacturers m2 ON m2.id = p2.manufacturer_id WHERE COALESCE(a2.applicant_name, m2.manufacturer_name, 'Unknown company') = COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company')) BETWEEN 1 AND 2")
-        elif size_bucket == "medium":
-            where.append("(SELECT COUNT(*) FROM products p2 LEFT JOIN applicants a2 ON a2.id = p2.applicant_id LEFT JOIN manufacturers m2 ON m2.id = p2.manufacturer_id WHERE COALESCE(a2.applicant_name, m2.manufacturer_name, 'Unknown company') = COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company')) BETWEEN 3 AND 8")
-        else:
-            where.append("(SELECT COUNT(*) FROM products p2 LEFT JOIN applicants a2 ON a2.id = p2.applicant_id LEFT JOIN manufacturers m2 ON m2.id = p2.manufacturer_id WHERE COALESCE(a2.applicant_name, m2.manufacturer_name, 'Unknown company') = COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company')) >= 9")
-    if filters.get("opportunity_score"):
-        min_score = int(filters["opportunity_score"])
-        where.append("0 = 0")
-    if filters.get("last_updated"):
-        if filters["last_updated"] == "30":
-            where.append("p.source_last_updated IS NOT NULL AND date(p.source_last_updated) >= date('now', '-30 days')")
-        elif filters["last_updated"] == "90":
-            where.append("p.source_last_updated IS NOT NULL AND date(p.source_last_updated) >= date('now', '-90 days')")
-        elif filters["last_updated"] == "365":
-            where.append("p.source_last_updated IS NOT NULL AND date(p.source_last_updated) >= date('now', '-365 days')")
-
-    query = """
-        SELECT
-            p.id,
-            p.product_name,
-            p.registration_number,
-            p.strength,
-            p.status,
-            p.approval_date,
-            p.source_last_updated,
-            c.category_name,
-            df.form_name AS dosage_form,
-            COALESCE(a.applicant_name, m.manufacturer_name, 'Unknown company') AS company_name,
-            COALESCE(m.country, 'Unknown') AS country
-        FROM products p
-        LEFT JOIN applicants a ON a.id = p.applicant_id
-        LEFT JOIN manufacturers m ON m.id = p.manufacturer_id
-        LEFT JOIN categories c ON c.id = p.category_id
-        LEFT JOIN dosage_forms df ON df.id = p.dosage_form_id
-        WHERE {where_clause}
-        ORDER BY p.approval_date DESC, p.product_name
-    """.format(where_clause=" AND ".join(where))
-
-    rows = conn.execute(query, tuple(params)).fetchall()
-
-    grouped = defaultdict(list)
-    for row in rows:
-        company_name = row["company_name"] or "Unknown company"
-        grouped[company_name].append({
-            "id": row["id"],
-            "product_name": row["product_name"],
-            "registration_number": row["registration_number"],
-            "strength": row["strength"],
-            "status": row["status"] or "Unknown",
-            "approval_date": row["approval_date"],
-            "source_last_updated": row["source_last_updated"],
-            "category_name": row["category_name"],
-            "dosage_form": row["dosage_form"],
-            "country": row["country"] or "Unknown",
-        })
-
-    companies = []
-    for company_name, products in grouped.items():
-        product_count = len(products)
-        categories = [p["category_name"] for p in products if p.get("category_name")]
-        latest_update = max((p.get("source_last_updated") for p in products if p.get("source_last_updated")), default=None, key=lambda item: item or "")
-        latest_approval = max((p.get("approval_date") for p in products if p.get("approval_date")), default=None, key=lambda item: item or "")
-        latest_dt = _parse_date(latest_update or latest_approval)
-        score = _calc_opportunity_score(products)
-        companies.append({
-            "id": company_name.lower().replace(" ", "-") + f"-{product_count}",
-            "company": company_name,
-            "country": next((p["country"] for p in products if p.get("country")), "Unknown"),
-            "products": products,
-            "product_count": product_count,
-            "therapeutic_areas": sorted(set(categories)),
-            "registration_status": sorted({p["status"] for p in products})[0] if products else "Unknown",
-            "registration_year": _parse_date(latest_approval).year if latest_approval and _parse_date(latest_approval) else None,
-            "last_updated": latest_update or latest_approval,
-            "company_size": _derive_company_size(product_count),
-            "opportunity_score": score,
-            "estimated_value": product_count * 1250000,
-            "recommended_services": ["Regulatory Intelligence", "PV Support", "Clinical Development"],
-            "status": "Monitor" if score >= 70 else "Priority" if score >= 50 else "Watch",
-        })
-
-    if filters.get("opportunity_score"):
-        min_score = int(filters["opportunity_score"])
-        companies = [company for company in companies if company["opportunity_score"] >= min_score]
-
-    if filters.get("estimated_value"):
-        value_bucket = filters["estimated_value"]
-        if value_bucket == "lt_5m":
-            companies = [company for company in companies if company["estimated_value"] < 5_000_000]
-        elif value_bucket == "5m_10m":
-            companies = [company for company in companies if 5_000_000 <= company["estimated_value"] <= 10_000_000]
-        elif value_bucket == "gt_10m":
-            companies = [company for company in companies if company["estimated_value"] > 10_000_000]
-
-    sort_by = filters.get("sort_by", "score")
-    if sort_by == "company":
-        companies.sort(key=lambda company: company["company"].lower())
-    elif sort_by == "products":
-        companies.sort(key=lambda company: company["product_count"], reverse=True)
-    elif sort_by == "registration":
-        companies.sort(key=lambda company: company["registration_year"] or 0, reverse=True)
-    elif sort_by == "updated":
-        companies.sort(key=lambda company: company["last_updated"] or "", reverse=True)
-    elif sort_by == "alphabetical":
-        companies.sort(key=lambda company: company["company"].lower())
-    else:
-        companies.sort(key=lambda company: company["opportunity_score"], reverse=True)
-
-    return companies
-
+ALLOWED_CORS_ORIGINS = {
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+}
 
 app = Flask(__name__)
-ensure_database()
-ensure_crm_tables()
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": sorted(ALLOWED_CORS_ORIGINS),
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+        }
+    },
+    supports_credentials=True,
+    automatic_options=True,
+)
+_validate_startup_config()
 
 SYNC_SCHEDULER_ENABLED = os.getenv("SYNC_SCHEDULER_ENABLED", "false").strip().lower() == "true"
 if SYNC_SCHEDULER_ENABLED:
@@ -2189,14 +1361,6 @@ def _verify_cron_secret() -> bool:
     return request.headers.get("X-Cron-Secret", "").strip() == secret
 
 
-ALLOWED_CORS_ORIGINS = {
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5175",
-    "http://127.0.0.1:5175",
-}
-
-
 def _cors_origin_allowed(origin: str | None) -> str | None:
     if not origin:
         return None
@@ -2207,30 +1371,15 @@ def _cors_origin_allowed(origin: str | None) -> str | None:
     return None
 
 
-@app.before_request
-def handle_cors_preflight():
-    origin = request.headers.get("Origin")
-    if request.method == "OPTIONS" and origin:
-        allowed_origin = _cors_origin_allowed(origin)
-        if allowed_origin:
-            response = jsonify({"ok": True})
-            response.headers["Access-Control-Allow-Origin"] = allowed_origin
-            # allow common mutation verbs used by the frontend
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PATCH, PUT, DELETE"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-            response.headers["Access-Control-Max-Age"] = "600"
-            response.status_code = 200
-            return response
-
-
 @app.after_request
-def add_cors_headers(response):
-    origin = request.headers.get("Origin")
-    allowed_origin = _cors_origin_allowed(origin)
-    if allowed_origin:
-        response.headers["Access-Control-Allow-Origin"] = allowed_origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Vary"] = "Origin"
+def _apply_api_cors_headers(response):
+    if request.path.startswith("/api/"):
+        origin = _cors_origin_allowed(request.headers.get("Origin"))
+        if origin:
+            response.headers.setdefault("Access-Control-Allow-Origin", origin)
+            response.headers.setdefault("Access-Control-Allow-Credentials", "true")
+            response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+            response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     return response
 
 
@@ -2242,201 +1391,378 @@ def money(value):
         return "₦0"
 
 
+@app.template_filter("format_date")
+def format_date(value: Any) -> str:
+    parsed = _parse_dashboard_date(value)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%d %b %Y")
+
+
+def _safe_dashboard_metric(label: str, callback, default: Any = "N/A") -> Any:
+    try:
+        return callback()
+    except Exception:
+        logger.exception("Legacy dashboard metric failed: %s", label)
+        return default
+
+
+def _parse_dashboard_date(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace(" ", "T"))
+    except ValueError:
+        return None
+
+
 @app.route("/")
 def dashboard():
-    conn = connect()
-    try:
-        manufacturers = scalar(conn, "SELECT COUNT(*) FROM manufacturers")
-        products = scalar(conn, "SELECT COUNT(*) FROM products")
-        if table_exists(conn, "revenue_pipeline"):
-            opportunities = scalar(conn, "SELECT COUNT(*) FROM revenue_pipeline")
-            pipeline_value = scalar(conn, "SELECT COALESCE(SUM(estimated_value), 0) FROM revenue_pipeline")
-            top_accounts = conn.execute(
-                "SELECT company, category, products, estimated_value, recommended_services, status FROM revenue_pipeline ORDER BY estimated_value DESC, products DESC LIMIT 25"
-            ).fetchall()
-        else:
-            opportunities = 0
-            pipeline_value = 0
-            top_accounts = []
-        expiring = scalar(
-            conn,
-            "SELECT COUNT(*) FROM products WHERE expiry_date IS NOT NULL AND date(expiry_date) BETWEEN date('now') AND date('now', '+12 months')",
-        )
-        categories = conn.execute(
-            "SELECT COALESCE(c.category_name, 'Unknown') AS category, COUNT(p.id) AS product_count FROM products p LEFT JOIN categories c ON c.id = p.category_id GROUP BY c.category_name ORDER BY product_count DESC"
-        ).fetchall()
-        renewals = conn.execute(
-            "SELECT COALESCE(a.applicant_name, m.manufacturer_name, 'Not provided') AS company, COUNT(*) AS expiring_products FROM products p LEFT JOIN applicants a ON a.id = p.applicant_id LEFT JOIN manufacturers m ON m.id = p.manufacturer_id WHERE p.expiry_date IS NOT NULL AND date(p.expiry_date) BETWEEN date('now') AND date('now', '+12 months') GROUP BY company ORDER BY expiring_products DESC LIMIT 20"
-        ).fetchall()
-        latest_sync = conn.execute(
-            "SELECT started_at, finished_at, status, products_added, products_updated, products_removed, duration_seconds, error_message FROM sync_history ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        last_sync_payload = None
-        if latest_sync:
-            last_sync_payload = {
-                "started_at": latest_sync["started_at"],
-                "finished_at": latest_sync["finished_at"],
-                "status": latest_sync["status"] or "unknown",
-                "products_added": int(latest_sync["products_added"] or 0),
-                "products_updated": int(latest_sync["products_updated"] or 0),
-                "products_removed": int(latest_sync["products_removed"] or 0),
-                "duration_seconds": int(latest_sync["duration_seconds"] or 0),
-                "error_message": latest_sync["error_message"],
+    return legacy_dashboard()
+
+
+@app.route("/dashboard")
+@app.route("/legacy-dashboard")
+def legacy_dashboard():
+    product_repo = ProductRepository()
+    company_repo = CompanyRepository()
+    pipeline_repo = PipelineRepository()
+    db_backend = "Supabase" if get_db().client is not None else "SQLite"
+
+    products_rows = _safe_dashboard_metric("products", lambda: product_repo.list(limit=10000), default=[])
+    product_count = _safe_dashboard_metric("product_count", lambda: product_repo.db.count(product_repo.table_name), default="N/A")
+    manufacturer_values = _safe_dashboard_metric(
+        "manufacturer_count",
+        lambda: {
+            row.get("manufacturer_name") or row.get("manufacturer_id")
+            for row in products_rows
+            if isinstance(row, dict) and (row.get("manufacturer_name") or row.get("manufacturer_id"))
+        },
+        default=set(),
+    )
+    manufacturers_count = len(manufacturer_values) if isinstance(manufacturer_values, set) else "N/A"
+
+    pipeline_rows = _safe_dashboard_metric("pipeline_rows", lambda: pipeline_repo.list(limit=10000), default=[])
+    opportunities_count = _safe_dashboard_metric("opportunities_count", lambda: len(pipeline_rows), default="N/A")
+    pipeline_value = _safe_dashboard_metric(
+        "pipeline_value",
+        lambda: sum(float(row.get("estimated_value") or 0) for row in pipeline_rows if isinstance(row, dict)),
+        default="N/A",
+    )
+
+    now = datetime.now(timezone.utc)
+    expiring_count = _safe_dashboard_metric(
+        "expiring_count",
+        lambda: sum(
+            1
+            for row in products_rows
+            if isinstance(row, dict)
+            and (row.get("expiry_date") or "")
+            and (row.get("status") or "").lower() not in {"expired", "revoked", "withdrawn"}
+            and (parsed := _parse_dashboard_date(row.get("expiry_date"))) is not None
+            and parsed >= now.replace(tzinfo=None)
+            and parsed <= (now.replace(tzinfo=None) + timedelta(days=365))
+        ),
+        default="N/A",
+    )
+
+    top_accounts = _safe_dashboard_metric(
+        "top_accounts",
+        lambda: [
+            {
+                "company": row.get("company") or "Unknown",
+                "category": row.get("category") or "Uncategorized",
+                "products": row.get("products") or "0",
+                "estimated_value": row.get("estimated_value") or 0,
+                "recommended_services": row.get("recommended_services") or "—",
+                "status": row.get("status") or "unknown",
             }
-        return render_template(
-            "dashboard.html",
-            manufacturers=manufacturers,
-            products=products,
-            opportunities=opportunities,
-            pipeline_value=pipeline_value,
-            expiring=expiring,
-            categories=categories,
-            top_accounts=top_accounts,
-            renewals=renewals,
-            db=str(db_path()),
-            last_sync_payload=last_sync_payload,
-        )
-    finally:
-        conn.close()
+            for row in sorted(pipeline_rows, key=lambda item: float(item.get("estimated_value") or 0), reverse=True)[:8]
+            if isinstance(row, dict)
+        ],
+        default=[],
+    )
+
+    categories = _safe_dashboard_metric(
+        "categories",
+        lambda: [
+            {"category": category, "product_count": count}
+            for category, count in sorted(
+                ((entry[0], entry[1]) for entry in defaultdict(int, ((row.get("category") or "Uncategorized", 1) for row in pipeline_rows if isinstance(row, dict))).items()),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:8]
+        ],
+        default=[],
+    )
+
+    renewals = _safe_dashboard_metric(
+        "renewals",
+        lambda: [
+            {
+                "company": row.get("manufacturer_name") or row.get("manufacturer_id") or row.get("product_name") or "Unknown",
+                "expiring_products": 1,
+            }
+            for row in products_rows
+            if isinstance(row, dict)
+            and (row.get("expiry_date") or "")
+            and (parsed := _parse_dashboard_date(row.get("expiry_date"))) is not None
+            and parsed >= now.replace(tzinfo=None)
+            and parsed <= (now.replace(tzinfo=None) + timedelta(days=365))
+        ][:8],
+        default=[],
+    )
+
+    last_sync_payload = None
+    try:
+        sync_rows = get_db().table_select("sync_history", order="id.desc", limit=1)
+        if sync_rows:
+            last_sync_payload = dict(sync_rows[0])
+    except Exception:
+        logger.exception("Legacy dashboard sync history lookup failed")
+        last_sync_payload = None
+
+    print(f"Products: {product_count}")
+    print(f"Manufacturers: {manufacturers_count}")
+    print(f"Revenue Pipeline: {opportunities_count}")
+    print(f"Pipeline Value: {pipeline_value}")
+    print(f"Renewals: {expiring_count}")
+
+    return render_template(
+        "dashboard.html",
+        manufacturers=manufacturers_count,
+        products=product_count,
+        opportunities=opportunities_count,
+        pipeline_value=pipeline_value,
+        expiring=expiring_count,
+        last_sync_payload=last_sync_payload,
+        top_accounts=top_accounts,
+        categories=categories,
+        renewals=renewals,
+        db=db_backend,
+    )
+
+
+def _build_products_page_context(repo: ProductRepository, q: str, manufacturer: str, category: str, applicant: str, status: str, expiry: str, sort_by: str, page: int, page_size: int) -> tuple[list[dict], int, list[dict], list[dict], int, int]:
+    rows, total, categories, statuses = repo.list_page(
+        query=q,
+        manufacturer=manufacturer,
+        category=category,
+        applicant=applicant,
+        status=status,
+        expiry=expiry,
+        sort_by=sort_by,
+        page=page,
+        page_size=page_size,
+    )
+    return rows, total, categories, statuses, max(int(page or 1), 1), max(min(int(page_size or 50), 200), 1)
 
 
 @app.route("/products")
 def products():
-    q = request.args.get("q", "").strip()
-    category = request.args.get("category", "").strip()
-    status = request.args.get("status", "").strip()
-    page = max(request.args.get("page", 1, type=int), 1)
-    size = 50
-    offset = (page - 1) * size
+    start_time = perf_counter()
+    repo = ProductRepository()
+    q = request.args.get("q", "", type=str)
+    manufacturer = request.args.get("manufacturer", "", type=str)
+    category = request.args.get("category", "", type=str)
+    applicant = request.args.get("applicant", "", type=str)
+    status = request.args.get("status", "", type=str)
+    expiry = request.args.get("expiry", "", type=str)
+    sort_by = request.args.get("sort", "", type=str)
+    page = request.args.get("page", 1, type=int)
+    page_size = request.args.get("page_size", 50, type=int)
 
-    where = ["1=1"]
-    params = []
-    if q:
-        like = f"%{q}%"
-        where.append("(p.product_name LIKE ? OR p.active_ingredient LIKE ? OR p.registration_number LIKE ? OR a.applicant_name LIKE ? OR m.manufacturer_name LIKE ?)")
-        params.extend([like] * 5)
-    if category:
-        where.append("c.category_name = ?")
-        params.append(category)
-    if status:
-        where.append("p.status = ?")
-        params.append(status)
-
-    where_clause = " AND ".join(where)
-    conn = connect()
     try:
-        total = scalar(
-            conn,
-            f"SELECT COUNT(*) FROM products p LEFT JOIN applicants a ON a.id = p.applicant_id LEFT JOIN manufacturers m ON m.id = p.manufacturer_id LEFT JOIN categories c ON c.id = p.category_id WHERE {where_clause}",
-            tuple(params),
+        rows, total, categories, statuses, page, page_size = _build_products_page_context(
+            repo,
+            q=q,
+            manufacturer=manufacturer,
+            category=category,
+            applicant=applicant,
+            status=status,
+            expiry=expiry,
+            sort_by=sort_by,
+            page=page,
+            page_size=page_size,
         )
-        rows = conn.execute(
-            f"SELECT p.id AS greenbook_product_id, p.product_name, p.active_ingredient AS ingredient_name, c.category_name AS product_category, p.registration_number AS nafdac_number, a.applicant_name, m.manufacturer_name, p.approval_date, p.expiry_date, p.status FROM products p LEFT JOIN applicants a ON a.id = p.applicant_id LEFT JOIN manufacturers m ON m.id = p.manufacturer_id LEFT JOIN categories c ON c.id = p.category_id WHERE {where_clause} ORDER BY p.approval_date DESC, p.product_name LIMIT ? OFFSET ?",
-            tuple(params + [size, offset]),
-        ).fetchall()
-        categories = conn.execute("SELECT DISTINCT c.category_name AS category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE c.category_name IS NOT NULL ORDER BY c.category_name").fetchall()
-        statuses = conn.execute("SELECT DISTINCT status FROM products WHERE status IS NOT NULL ORDER BY status").fetchall()
-        return render_template("products.html", rows=rows, q=q, category=category, status=status, categories=categories, statuses=statuses, total=total, page=page, size=size)
-    finally:
-        conn.close()
+    except Exception:
+        logger.exception("Products page failed")
+        rows = []
+        total = 0
+        categories = []
+        statuses = []
+        page = max(page or 1, 1)
+        page_size = max(page_size or 50, 50)
+
+    elapsed_ms = (perf_counter() - start_time) * 1000
+    print(f"Products loaded: {total}")
+    print(f"Returned: {len(rows)}")
+    print(f"Current page: {page}")
+    print(f"Execution time: {elapsed_ms:.2f}ms")
+
+    if not rows and not categories and not statuses and total == 0:
+        error_message = "Unable to load products."
+    else:
+        error_message = ""
+
+    return render_template(
+        "products.html",
+        rows=rows,
+        q=q,
+        manufacturer=manufacturer,
+        category=category,
+        applicant=applicant,
+        status=status,
+        expiry=expiry,
+        sort=sort_by,
+        categories=categories,
+        statuses=statuses,
+        total=total,
+        page=page,
+        size=page_size,
+        error_message=error_message,
+    )
 
 
 @app.route("/products/<int:pid>")
 def product_detail(pid):
-    conn = connect()
-    try:
-        row = conn.execute(
-            """
-            SELECT
-                p.id,
-                p.nafdac_product_id,
-                p.registration_number AS nafdac_number,
-                p.product_name,
-                p.generic_name,
-                p.active_ingredient,
-                p.strength,
-                p.pack_size,
-                p.composition,
-                p.approval_date,
-                p.expiry_date,
-                p.status,
-                p.description,
-                p.source_last_updated,
-                c.category_name AS product_category,
-                a.applicant_name,
-                m.manufacturer_name,
-                df.form_name AS dosage_form,
-                r.route_name AS route_of_administration,
-                p.source_last_updated
-            FROM products p
-            LEFT JOIN categories c ON c.id = p.category_id
-            LEFT JOIN applicants a ON a.id = p.applicant_id
-            LEFT JOIN manufacturers m ON m.id = p.manufacturer_id
-            LEFT JOIN dosage_forms df ON df.id = p.dosage_form_id
-            LEFT JOIN routes r ON r.id = p.route_id
-            WHERE p.id = ?
-            """,
-            (pid,),
-        ).fetchone()
-        if not row:
-            abort(404)
-        return render_template("product_detail.html", product=row)
-    finally:
-        conn.close()
+    repo = ProductRepository()
+    row = repo.get_by_id(pid)
+    if not row:
+        abort(404)
+    product = _to_plain_dict(row)
+    return render_template("product_detail.html", product={
+        **product,
+        "product_category": product.get("category_name") or product.get("product_category") or product.get("therapeutic_area") or "",
+        "nafdac_number": product.get("registration_number") or product.get("nafdac_number") or product.get("nafdac_product_id") or "",
+        "applicant_name": product.get("applicant_name") or product.get("manufacturer_name") or "",
+        "manufacturer_name": product.get("manufacturer_name") or product.get("applicant_name") or "",
+        "dosage_form": product.get("dosage_form") or product.get("dosage_form_name") or "",
+        "route_of_administration": product.get("route_of_administration") or product.get("route_name") or "",
+        "strength": product.get("strength") or "",
+        "approval_date": product.get("approval_date") or "",
+        "expiry_date": product.get("expiry_date") or "",
+        "status": product.get("status") or "",
+        "pack_size": product.get("pack_size") or "",
+        "composition": product.get("composition") or "",
+    })
 
 
 @app.route("/opportunities")
 def opportunities():
-    q = request.args.get("q", "").strip()
-    product_category = request.args.get("product_category", "").strip()
-    registration_status = request.args.get("registration_status", "").strip()
-    estimated_value = request.args.get("estimated_value", "").strip()
-    sort_by = request.args.get("sort_by", "score").strip()
-
+    page = max(int(request.args.get("page", 1, type=int) or 1), 1)
+    page_size = max(min(int(request.args.get("page_size", 50, type=int) or 50), 200), 1)
     filters = {
-        "q": q,
-        "product_category": product_category,
-        "registration_status": registration_status,
-        "estimated_value": estimated_value,
-        "sort_by": sort_by,
+        "q": request.args.get("q", "", type=str),
+        "status": request.args.get("status", "", type=str),
+        "priority": request.args.get("priority", "", type=str),
+        "probability": request.args.get("probability", "", type=str),
+        "estimated_value": request.args.get("estimated_value", "", type=str),
+        "category": request.args.get("category", "", type=str),
+        "service": request.args.get("service", "", type=str),
+        "manufacturer": request.args.get("manufacturer", "", type=str),
+        "sort_by": request.args.get("sort_by", "", type=str),
     }
 
-    conn = connect()
+    started_at = perf_counter()
+    rows, total, categories, statuses, services, manufacturers, summary = [], 0, [], [], [], [], {
+        "total_opportunities": 0,
+        "high_priority": 0,
+        "closing_soon": 0,
+        "total_pipeline_value": 0.0,
+        "average_opportunity_value": 0.0,
+    }
+    error_message = ""
+
     try:
-        rows = _build_opportunity_rows(conn, filters)
-        categories = conn.execute(
-            "SELECT DISTINCT c.category_name AS category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE c.category_name IS NOT NULL ORDER BY c.category_name"
-        ).fetchall()
-        statuses = conn.execute(
-            "SELECT DISTINCT status FROM products WHERE status IS NOT NULL ORDER BY status"
-        ).fetchall()
-        return render_template(
-            "opportunities.html",
-            rows=rows,
-            q=q,
-            product_category=product_category,
-            registration_status=registration_status,
-            estimated_value=estimated_value,
-            sort_by=sort_by,
-            categories=categories,
-            statuses=statuses,
+        rows, total, categories, statuses, services, manufacturers, summary = PipelineRepository().list_page(
+            query=filters.get("q", ""),
+            status=filters.get("status", ""),
+            priority=filters.get("priority", ""),
+            probability=filters.get("probability", ""),
+            estimated_value=filters.get("estimated_value", ""),
+            category=filters.get("category", ""),
+            service=filters.get("service", ""),
+            manufacturer=filters.get("manufacturer", ""),
+            sort_by=filters.get("sort_by", ""),
+            page=page,
+            page_size=page_size,
         )
-    finally:
-        conn.close()
+    except Exception:
+        logger.exception("Unable to load opportunities from revenue_pipeline")
+        error_message = "Unable to load opportunities."
+
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    print(f"Revenue Pipeline Rows: {total}")
+    print(f"Returned: {len(rows)}")
+    print(f"Current Page: {page}")
+    print(f"Execution Time: {elapsed_ms:.2f}ms")
+
+    return render_template(
+        "opportunities.html",
+        rows=rows,
+        q=filters.get("q", ""),
+        status=filters.get("status", ""),
+        priority=filters.get("priority", ""),
+        probability=filters.get("probability", ""),
+        estimated_value=filters.get("estimated_value", ""),
+        category=filters.get("category", ""),
+        service=filters.get("service", ""),
+        manufacturer=filters.get("manufacturer", ""),
+        sort_by=filters.get("sort_by", ""),
+        categories=categories,
+        statuses=statuses,
+        services=services,
+        manufacturers=manufacturers,
+        total=total,
+        page=page,
+        page_size=page_size,
+        summary=summary,
+        error_message=error_message,
+    )
 
 
 @app.route("/renewals")
 def renewal_watch():
-    months = min(max(request.args.get("months", 12, type=int), 1), 60)
-    conn = connect()
+    error_message = None
+    started_at = perf_counter()
+    months = max(int(request.args.get("months", 12)), 1)
+    page = max(int(request.args.get("page", 1)), 1)
+    page_size = max(min(int(request.args.get("page_size", 100)), 1000), 1)
+    rows = []
+    total = 0
+    summary = {}
     try:
-        rows = conn.execute(
-            "SELECT product_name, registration_number AS nafdac_number, c.category_name AS product_category, a.applicant_name, m.manufacturer_name, expiry_date, status FROM products p LEFT JOIN applicants a ON a.id = p.applicant_id LEFT JOIN manufacturers m ON m.id = p.manufacturer_id LEFT JOIN categories c ON c.id = p.category_id WHERE p.expiry_date IS NOT NULL AND date(p.expiry_date) BETWEEN date('now') AND date('now', ?) ORDER BY date(p.expiry_date), a.applicant_name LIMIT 1000",
-            (f"+{months} months",),
-        ).fetchall()
-        return render_template("renewals.html", rows=rows, months=months)
-    finally:
-        conn.close()
+        repo = RenewalRepository()
+        rows, total, summary = repo.list_page(months=months, page=page, page_size=page_size, query=request.args.get("q", ""))
+    except Exception:
+        logger.exception("Unable to load renewals from products")
+        error_message = "Unable to load renewals."
+
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    print(f"Renewal Rows: {total}")
+    print(f"Returned: {len(rows)}")
+    print(f"Current Page: {page}")
+    print(f"Execution Time: {elapsed_ms:.2f}ms")
+
+    return render_template(
+        "renewals.html",
+        rows=rows,
+        months=months,
+        total=total,
+        page=page,
+        page_size=page_size,
+        summary=summary,
+        error_message=error_message,
+    )
 
 
 @app.route("/crm")
@@ -2461,88 +1787,67 @@ def crm_companies():
 
 @app.route("/api/growhub/crm/companies")
 def growhub_crm_companies():
-    conn = connect()
-    try:
-        return jsonify(_build_growhub_company_payloads(conn))
-    finally:
-        conn.close()
+    page = _parse_int_query_arg("page", 1, min_value=1)
+    per_page = _parse_int_query_arg("per_page", 100, min_value=1, max_value=500)
+    query = (request.args.get("q") or "").strip()
+
+    service = CompanyService()
+    if query:
+        companies_payload = service.search_companies(query, page=page, per_page=per_page)
+        companies = companies_payload.get("items", [])
+    else:
+        companies = service.list_companies(page=page, per_page=per_page).get("items", [])
+
+    return jsonify(_build_growhub_company_payloads(companies))
 
 
 @app.route("/api/growhub/crm/data")
 def growhub_crm_data():
-    conn = connect()
-    try:
-        companies = _build_growhub_company_payloads(conn)
-        payload = _build_growhub_related_payloads(conn, companies)
-        return jsonify(payload)
-    finally:
-        conn.close()
+    page = _parse_int_query_arg("page", 1, min_value=1)
+    per_page = _parse_int_query_arg("per_page", 100, min_value=1, max_value=500)
+    query = (request.args.get("q") or "").strip()
+
+    service = CompanyService()
+    if query:
+        companies_payload = service.search_companies(query, page=page, per_page=per_page)
+        companies = companies_payload.get("items", [])
+    else:
+        companies = service.list_companies(page=page, per_page=per_page).get("items", [])
+
+    return jsonify({"success": True, **_build_growhub_related_payloads(companies)})
 
 
 @app.route("/api/crm/companies/<int:company_id>")
 def crm_company_detail_json(company_id):
-    # If MEDNOVA_DB_PATH is configured (tests / legacy), keep sqlite behavior
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company = conn.execute("SELECT * FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            if not company:
-                abort(404)
+    """Get company detail with related data (contacts, tasks, notes, activities)."""
+    try:
+        service = CompanyService()
+        detail = service.get_company_detail(company_id)
 
-            products = json.loads(company["greenbook_products_json"] or "[]") if company["greenbook_products_json"] else []
-            activities = [
-                _row_to_dict(row)
-                for row in conn.execute(
-                    "SELECT activity_type, title, body, created_at FROM crm_activities WHERE crm_company_id = ? ORDER BY created_at DESC",
-                    (company_id,),
-                ).fetchall()
-            ]
-            notes = [
-                _row_to_dict(row)
-                for row in conn.execute(
-                    "SELECT id, body, created_at FROM crm_notes WHERE crm_company_id = ? ORDER BY created_at DESC",
-                    (company_id,),
-                ).fetchall()
-            ]
-            contacts = [
-                _row_to_dict(row)
-                for row in conn.execute(
-                    "SELECT id, full_name, role, department, email, phone, source, created_at, source_url, discovered_at, confidence_score, verification_status, website, linkedin_url, notes FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC",
-                    (company_id,),
-                ).fetchall()
-            ]
-            tasks = [
-                _row_to_dict(row)
-                for row in conn.execute(
-                    "SELECT id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE crm_company_id = ? ORDER BY due_date IS NULL, due_date, created_at DESC",
-                    (company_id,),
-                ).fetchall()
-            ]
+        if not detail:
+            abort(404)
 
-            return jsonify({
-                "company": _row_to_dict(company),
-                "products": products,
-                "activities": activities,
-                "notes": notes,
-                "contacts": contacts,
-                "tasks": tasks,
-            })
-        finally:
-            conn.close()
+        logger.info("Retrieved company detail for company_id=%d", company_id)
 
-    # Otherwise use Supabase repository (production / Render)
-    detail = companies_repo.get_company_detail(company_id)
-    if not detail:
-        abort(404)
-    # repo returns company as dict and lists of dicts; return similar JSON structure
-    return jsonify({
-        "company": detail["company"],
-        "products": detail.get("products") or [],
-        "activities": detail.get("activities") or [],
-        "notes": detail.get("notes") or [],
-        "contacts": detail.get("contacts") or [],
-        "tasks": detail.get("tasks") or [],
-    })
+        company_name = _normalize_contact_value((detail.get("company") or {}).get("company_name") or "")
+        contacts = detail.get("contacts") or []
+        normalized_contacts = [_to_plain_dict(contact) for contact in contacts]
+        valid_contacts = [contact for contact in normalized_contacts if not _is_placeholder_contact_record(contact, company_name)]
+        if valid_contacts:
+            contacts = valid_contacts
+
+        # Preserve response structure exactly
+        return jsonify({
+            "company": detail.get("company") or {},
+            "products": detail.get("products") or [],
+            "activities": detail.get("activities") or [],
+            "notes": detail.get("notes") or [],
+            "contacts": contacts,
+            "tasks": detail.get("tasks") or [],
+        })
+    except Exception as e:
+        logger.error("Error retrieving company detail: %s", str(e))
+        abort(500)
 
 
 @app.route("/crm/companies/<int:company_id>")
@@ -2552,184 +1857,243 @@ def crm_company_detail(company_id):
 
 @app.route("/crm/companies/<int:company_id>/outreach", methods=["GET", "POST"])
 def crm_company_outreach(company_id):
-    conn = connect()
+    company = CompanyService().get_company(company_id)
+    if not company:
+        abort(404)
+
+    contacts_payload = ContactService().list_contacts(company_id, page=1, per_page=100)
+    contacts = contacts_payload.get("items", [])
+    templates = _build_template_catalog()
+    preview = None
+    history = []
+    initial_subject = ""
+    initial_body = ""
+    recipient = ""
+    recipient_name = ""
+    sender_name = _default_sender_name()
+    sender_email = _default_sender_email()
+    warning_message = None
+    preview_error = None
+    draft_id = None
+    resend_status = _outreach_status_payload()
+    resend_warning_message = None
+    if not resend_status.get("resendConfigured"):
+        diagnostics = resend_status.get("diagnostics") or {}
+        if not diagnostics.get("resendApiKeyConfigured"):
+            resend_warning_message = "Missing RESEND_API_KEY."
+        elif not diagnostics.get("senderEmailConfigured"):
+            resend_warning_message = "Missing FROM_EMAIL."
+        else:
+            resend_warning_message = "Resend configuration is incomplete."
+
+    payload = _coerce_request_payload() if request.method == "POST" else {}
+    contact_id = payload.get("contact_id") or ""
+    template_key = payload.get("template_key") or "introduction"
+    sender_name = (payload.get("sender_name") or sender_name).strip()
+    sender_email = (payload.get("sender_email") or sender_email).strip()
+    recipient = (payload.get("recipient") or "").strip()
+    recipient_name = (payload.get("recipient_name") or "").strip()
+    contact_ids = [int(contact_id)] if str(contact_id).strip() else []
+
     try:
-        company = conn.execute("SELECT id, company_name, country, opportunity_score, opportunity_status, pipeline_stage, source, portfolio_summary, registration_numbers, dosage_forms, therapeutic_areas, registration_dates FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+        preview_data = _build_outreach_preview(company_id, template_key, contact_ids, sender_name, sender_email, recipient, recipient_name, int(contact_id) if str(contact_id).strip() else None)
+        initial_subject = preview_data["subject"]
+        initial_body = preview_data["body"]
+        recipient = preview_data["recipient"]
+        recipient_name = preview_data["recipient_name"]
+        sender_name = preview_data["sender_name"]
+        sender_email = preview_data["sender_email"]
+        preview = {"subject": preview_data["subject"], "body": preview_data["body"]}
+        warning_message = preview_data.get("warning_message")
+    except Exception as exc:
+        preview_error = str(exc)
 
-        contacts = conn.execute(
-            "SELECT id, full_name, role, department, email, phone FROM crm_contacts WHERE crm_company_id = ? ORDER BY created_at DESC",
-            (company_id,),
-        ).fetchall()
-        templates = _build_template_catalog()
-        preview = None
-        history = []
-        initial_subject = ""
-        initial_body = ""
-        recipient = ""
-        recipient_name = ""
-        sender_name = _default_sender_name()
-        sender_email = _default_sender_email()
-        warning_message = None
-        preview_error = None
-        draft_id = None
-        resend_status = _outreach_status_payload()
-        resend_warning_message = None
-        if not resend_status.get("resendConfigured"):
-            diagnostics = resend_status.get("diagnostics") or {}
-            if not diagnostics.get("resendApiKeyConfigured"):
-                resend_warning_message = "Missing RESEND_API_KEY."
-            elif not diagnostics.get("senderEmailConfigured"):
-                resend_warning_message = "Missing FROM_EMAIL."
-            else:
-                resend_warning_message = "Resend configuration is incomplete."
+    history = [
+        _to_plain_dict(row)
+        for row in OutreachService().list_outreach(company_id, page=1, per_page=10).get("items", [])
+    ]
 
-        payload = _coerce_request_payload() if request.method == "POST" else {}
-        contact_id = payload.get("contact_id") or ""
-        template_key = payload.get("template_key") or "introduction"
-        sender_name = (payload.get("sender_name") or sender_name).strip()
-        sender_email = (payload.get("sender_email") or sender_email).strip()
-        recipient = (payload.get("recipient") or "").strip()
-        recipient_name = (payload.get("recipient_name") or "").strip()
-        contact_ids = [int(contact_id)] if str(contact_id).strip() else []
-
-        try:
-            preview_data = _build_outreach_preview(conn, company_id, template_key, contact_ids, sender_name, sender_email, recipient, recipient_name, int(contact_id) if str(contact_id).strip() else None)
-            initial_subject = preview_data["subject"]
-            initial_body = preview_data["body"]
-            recipient = preview_data["recipient"]
-            recipient_name = preview_data["recipient_name"]
-            sender_name = preview_data["sender_name"]
-            sender_email = preview_data["sender_email"]
-            preview = {"subject": preview_data["subject"], "body": preview_data["body"]}
-            warning_message = preview_data.get("warning_message")
-        except Exception as exc:
-            preview_error = str(exc)
-
-        history = [
-            _row_to_dict(row)
-            for row in conn.execute(
-                "SELECT id, subject, body, status, created_at FROM crm_outreach_emails WHERE crm_company_id = ? ORDER BY created_at DESC LIMIT 10",
-                (company_id,),
-            ).fetchall()
-        ]
-
-        return render_template(
-            "crm_outreach.html",
-            company=company,
-            contacts=contacts,
-            templates=templates,
-            preview=preview,
-            history=history,
-            initial_subject=initial_subject,
-            initial_body=initial_body,
-            recipient=recipient,
-            recipient_name=recipient_name,
-            sender_name=sender_name,
-            sender_email=sender_email,
-            warning_message=warning_message,
-            preview_error=preview_error,
-            draft_id=draft_id,
-            resendConfigured=resend_status["resendConfigured"],
-            senderConfigured=resend_status["senderConfigured"],
-            senderEmail=resend_status["senderEmail"],
-            environmentLoaded=resend_status["environmentLoaded"],
-            resend_warning_message=resend_warning_message,
-        )
-    finally:
-        conn.close()
+    return render_template(
+        "crm_outreach.html",
+        company=company,
+        contacts=contacts,
+        templates=templates,
+        preview=preview,
+        history=history,
+        initial_subject=initial_subject,
+        initial_body=initial_body,
+        recipient=recipient,
+        recipient_name=recipient_name,
+        sender_name=sender_name,
+        sender_email=sender_email,
+        warning_message=warning_message,
+        preview_error=preview_error,
+        draft_id=draft_id,
+        resendConfigured=resend_status["resendConfigured"],
+        senderConfigured=resend_status["senderConfigured"],
+        senderEmail=resend_status["senderEmail"],
+        environmentLoaded=resend_status["environmentLoaded"],
+        resend_warning_message=resend_warning_message,
+    )
 
 
 @app.route("/api/crm/companies/<int:company_id>/pipeline-stage", methods=["PATCH"])
 def update_company_pipeline_stage(company_id):
+    """Update company pipeline stage."""
     payload = request.get_json(silent=True) or {}
     stage_value = payload.get("pipelineStage") or payload.get("stage")
     if not stage_value:
         return jsonify({"error": "pipelineStage is required"}), 400
 
-    stage = _crm_deal_stage_to_frontend(stage_value)
-    # Legacy sqlite path
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            if not company:
-                abort(404)
-
-            conn.execute("UPDATE crm_companies SET pipeline_stage = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (stage.title(), company_id))
-            add_activity(conn, company_id, "company", "Pipeline stage updated", f"Updated pipeline stage for {company['company_name']} to {stage.title()}")
-            conn.commit()
-            row = conn.execute("SELECT id, company_name, pipeline_stage FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            return jsonify({"success": True, "company": _row_to_dict(row)})
-        finally:
-            conn.close()
-
-    # Supabase path
-    company = companies_repo.get_company(company_id)
-    if not company:
+    try:
+        service = CompanyService()
+        stage = _crm_deal_stage_to_frontend(stage_value)
+        updated = service.update_company(company_id, {"pipeline_stage": stage.title()})
+        service.add_activity(company_id, "pipeline", "Pipeline stage updated", f"Updated pipeline stage to {stage.title()} for {(getattr(updated, 'company_name', None) or (updated.get('company_name') if isinstance(updated, dict) else 'company'))}")
+        logger.info("Updated pipeline stage for company_id=%d to %s", company_id, stage.title())
+        return jsonify({"success": True, "company": updated if isinstance(updated, dict) else vars(updated)})
+    except LookupError:
         abort(404)
-    companies_repo.db.update("crm_companies", company_id, {"pipeline_stage": stage.title(), "updated_at": datetime.now(timezone.utc).isoformat()})
-    companies_repo.add_activity(company_id, "company", "Pipeline stage updated", f"Updated pipeline stage for {company.get('company_name')} to {stage.title()}")
-    updated = companies_repo.get_company(company_id)
-    return jsonify({"success": True, "company": updated})
+    except Exception as e:
+        logger.error("Error updating pipeline stage: %s", str(e))
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/crm/companies/<int:company_id>/contacts/discover", methods=["POST"])
 def discover_company_contacts(company_id):
-    # For discovery we rely on existing sqlite workflow for now (complex network operations)
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            if not company:
-                abort(404)
+    company = CompanyService().get_company(company_id)
+    if not company:
+        abort(404)
 
-            add_activity(conn, company_id, "contact", "Contact discovery started", f"Started public contact discovery for {company['company_name']}")
-            conn.commit()
+    company_name = getattr(company, "company_name", None) if company else None
+    company_name = company_name or (company.get("company_name") if isinstance(company, dict) else "")
+    search_query = company_name or ""
+    if not search_query:
+        return jsonify({"error": "Company name is required for discovery."}), 400
 
-            try:
-                profiles, imported_count, updated_count, duplicates_skipped = _discover_contacts_for_company(conn, company_id, company["company_name"])
-            except Exception as exc:
-                message = str(exc).strip() or "The public discovery provider rejected the request."
-                lowered_message = message.lower()
-                if (
-                    "nameresolutionerror" in lowered_message
-                    or "getaddrinfo" in lowered_message
-                    or "failed to resolve" in lowered_message
-                    or "max retries exceeded" in lowered_message
-                    or "timed out" in lowered_message
-                    or "timeout" in lowered_message
-                    or "readtimeout" in lowered_message
-                    or "connecttimeout" in lowered_message
-                ):
-                    message = "The public discovery service could not be reached from this environment."
-                add_activity(conn, company_id, "contact", "Enrichment failed", f"Contact discovery failed for {company['company_name']}: {message}")
-                conn.commit()
-                return jsonify({"success": False, "error": f"Contact discovery failed: {message}"}), 502
+    CompanyService().add_activity(company_id, "research", "Contact discovery started", f"Started contact discovery for {company_name}")
+    logger.info("Contact discovery started for company_id=%s name=%s", company_id, company_name)
+    contact_service = ContactService()
+    imported_count = 0
+    updated_count = 0
+    duplicates_skipped = 0
+    discovered_contacts: list[dict] = []
 
-            if imported_count:
-                add_activity(conn, company_id, "contact", "Contacts imported", f"Imported {imported_count} discovered contacts for {company['company_name']}")
-            if updated_count:
-                add_activity(conn, company_id, "contact", "Contacts updated", f"Updated {updated_count} discovered contacts for {company['company_name']}")
-            if duplicates_skipped:
-                add_activity(conn, company_id, "contact", "Duplicates skipped", f"Skipped {duplicates_skipped} duplicate contacts for {company['company_name']}")
-            add_activity(conn, company_id, "contact", "Enrichment completed", f"Completed contact discovery for {company['company_name']}")
-            conn.commit()
+    try:
+        intelligence_service = IntelligenceService()
+        search_query, tavily_payload = intelligence_service.search_company_contacts(company_id)
+        if tavily_payload is None:
+            logger.error("Contact discovery failed: Tavily search failed for company_id=%s query=%s", company_id, search_query)
+            message = intelligence_service.last_tavily_error or "Contact discovery provider failed."
+            return jsonify({"error": message}), 502
 
-            return jsonify({
-                "success": True,
-                "company_id": company_id,
-                "profiles_found": len(profiles),
-                "imported_count": imported_count,
-                "updated_count": updated_count,
-                "duplicates_skipped": duplicates_skipped,
+        results = tavily_payload.get("results") if isinstance(tavily_payload, dict) else []
+        if not isinstance(results, list):
+            results = []
+
+        logger.info("Tavily returned %d results for company='%s' query='%s'", len(results), company_name, search_query)
+
+        for result in results:
+            url = result.get("url") or ""
+            if not url:
+                continue
+            html_response = requests.get(url, timeout=10)
+            html_response.raise_for_status()
+            details = _extract_contact_details_from_html(url, html_response.text, company_name)
+            if not details.get("email") and not details.get("phone"):
+                continue
+
+            existing = _find_matching_contact(company_id, details)
+            if existing:
+                duplicates_skipped += 1
+                if existing.get("source") == "discovered":
+                    update_payload = {}
+                    if details.get("email") and not existing.get("email"):
+                        update_payload["email"] = details["email"]
+                    if details.get("phone") and not existing.get("phone"):
+                        update_payload["phone"] = details["phone"]
+                    if details.get("linkedin_url") and not existing.get("linkedin_url"):
+                        update_payload["linkedin_url"] = details["linkedin_url"]
+                    if details.get("role") and not existing.get("role"):
+                        update_payload["role"] = details["role"]
+                    if details.get("name") and not existing.get("full_name"):
+                        update_payload["full_name"] = details["name"]
+                    if update_payload:
+                        ContactService().update_contact(int(existing.get("id") or 0), {
+                            **update_payload,
+                            "updated_at": now_iso(),
+                        })
+                        updated_count += 1
+                continue
+
+            logger.info("Saving discovered contact for company '%s': name=%s email=%s phone=%s", company_name, details.get("name") or "<unknown>", details.get("email") or "", details.get("phone") or "")
+            created = contact_service.create_contact(company_id, {
+                "full_name": details.get("name") or "Public Contact",
+                "role": details.get("role") or "Public contact",
+                "email": details.get("email"),
+                "phone": details.get("phone"),
+                "website": details.get("website"),
+                "source": "discovered",
+                "source_url": details.get("source_url"),
+                "linkedin_url": details.get("linkedin_url"),
+                "created_at": now_iso(),
             })
-        finally:
-            conn.close()
+            created_dict = _to_plain_dict(created)
+            discovered_contacts.append(created_dict)
+            imported_count += 1
+            logger.info("Saved contact id=%s name=%s email=%s", created_dict.get("id"), created_dict.get("full_name"), created_dict.get("email"))
 
-    # If running against Supabase, discovery is not supported in Phase 1
-    return jsonify({"success": False, "error": "Contact discovery is not supported in Supabase mode yet"}), 501
+        placeholder_cleanup_count = 0
+        if discovered_contacts or updated_count or duplicates_skipped:
+            placeholder_cleanup_count = _cleanup_placeholder_contacts(company_id, company_name)
+
+        # If Tavily returned nothing, create a single placeholder contact
+        if imported_count == 0 and updated_count == 0 and duplicates_skipped == 0:
+            existing = [_to_plain_dict(c) for c in contact_service.list_contacts(company_id, page=1, per_page=1000).get("items", [])]
+            has_placeholder = any(((c.get("source") or "").strip().lower() == "placeholder") or _is_placeholder_contact_record(c, company_name) for c in existing)
+            if not has_placeholder:
+                logger.info("No contacts discovered for company '%s'; creating placeholder contact", company_name)
+                placeholder = contact_service.create_contact(company_id, {
+                    "full_name": f"{company_name} contact" if company_name else "No contact found",
+                    "role": "Unknown",
+                    "email": None,
+                    "phone": None,
+                    "website": None,
+                    "source": "placeholder",
+                    "enrichment_status": "failed",
+                    "created_at": now_iso(),
+                })
+                logger.info("Created placeholder contact for company_id=%s id=%s", company_id, getattr(placeholder, 'id', (placeholder.get('id') if isinstance(placeholder, dict) else None)))
+
+        logger.info(
+            "Contact discovery summary company_id=%s company_name=%s search_query=%s imported=%d updated=%d duplicates_skipped=%d placeholder_cleanup=%d",
+            company_id,
+            company_name,
+            search_query,
+            imported_count,
+            updated_count,
+            duplicates_skipped,
+            placeholder_cleanup_count,
+        )
+
+        CompanyService().add_activity(company_id, "research", "Contacts imported", f"Imported {imported_count} contacts for {company_name}")
+        CompanyService().add_activity(company_id, "research", "Enrichment completed", f"Completed contact discovery for {company_name}")
+        contacts_payload = ContactService().list_contacts(company_id, page=1, per_page=1000)
+        contacts = [_to_plain_dict(contact) for contact in contacts_payload.get("items", [])]
+        return jsonify({
+            "success": True,
+            "contacts": contacts,
+            "imported_count": imported_count,
+            "updated_count": updated_count,
+            "duplicates_skipped": duplicates_skipped,
+        })
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "The contact discovery provider could not be reached in time."}), 502
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Contact discovery failed: {str(exc)}"}), 502
+    except Exception as exc:
+        logger.exception("Contact discovery error: %s", exc)
+        return jsonify({"error": f"Contact discovery failed: {str(exc)}"}), 502
 
 
 @app.route("/api/outreach/status")
@@ -2750,27 +2114,22 @@ def build_outreach_email(company_id):
         contact_ids = [contact_ids]
     contact_ids = [int(item) for item in contact_ids if str(item).strip()]
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    company = CompanyService().get_company(company_id)
+    if not company:
+        abort(404)
 
-        contact_id = payload.get("contact_id")
-        if contact_id is not None and str(contact_id).strip():
-            contact_id = int(contact_id)
-        else:
-            contact_id = None
-        recipient = (payload.get("recipient") or "").strip()
-        recipient_name = (payload.get("recipient_name") or "").strip()
-        sender_name = (payload.get("sender_name") or _default_sender_name()).strip()
-        sender_email = (payload.get("sender_email") or _default_sender_email()).strip()
-        preview_data = _build_outreach_preview(conn, company_id, payload.get("template_key") or "introduction", contact_ids, sender_name, sender_email, recipient, recipient_name, contact_id)
-        add_activity(conn, company_id, "email", "Email drafted", f"Drafted {preview_data['template']} for {company['company_name']}")
-        conn.commit()
-        return jsonify({"success": True, "subject": preview_data["subject"], "body": preview_data["body"], "recipient": preview_data["recipient"], "recipientName": preview_data["recipient_name"], "senderName": preview_data["sender_name"], "senderEmail": preview_data["sender_email"], "template": preview_data["template"], "contact_count": len(contact_ids), "warning": preview_data.get("warning_message")})
-    finally:
-        conn.close()
+    contact_id = payload.get("contact_id")
+    if contact_id is not None and str(contact_id).strip():
+        contact_id = int(contact_id)
+    else:
+        contact_id = None
+    recipient = (payload.get("recipient") or "").strip()
+    recipient_name = (payload.get("recipient_name") or "").strip()
+    sender_name = (payload.get("sender_name") or _default_sender_name()).strip()
+    sender_email = (payload.get("sender_email") or _default_sender_email()).strip()
+    preview_data = _build_outreach_preview(company_id, payload.get("template_key") or "introduction", contact_ids, sender_name, sender_email, recipient, recipient_name, contact_id)
+    CompanyService().add_activity(company_id, "email", "Email drafted", f"Drafted {preview_data['template']} for {company.company_name if hasattr(company, 'company_name') else company.get('company_name')}")
+    return jsonify({"success": True, "subject": preview_data["subject"], "body": preview_data["body"], "recipient": preview_data["recipient"], "recipientName": preview_data["recipient_name"], "senderName": preview_data["sender_name"], "senderEmail": preview_data["sender_email"], "template": preview_data["template"], "contact_count": len(contact_ids), "warning": preview_data.get("warning_message")})
 
 
 @app.route("/api/crm/companies/<int:company_id>/outreach/drafts", methods=["POST"])
@@ -2781,60 +2140,75 @@ def save_outreach_draft(company_id):
     if not subject or not body:
         return jsonify({"error": "subject and body are required"}), 400
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    company = CompanyService().get_company(company_id)
+    if not company:
+        abort(404)
 
-        details = _resolve_outreach_persist_details(conn, company_id, company["company_name"], payload, template_key=payload.get("template_key") or "introduction", sender_name=(payload.get("sender_name") or _default_sender_name()).strip(), sender_email=(payload.get("sender_email") or _default_sender_email()).strip())
-        body_with_signature = _append_signature(details["body"], sender_name=details["sender_name"], sender_email=details["sender_email"])
-        draft_id = payload.get("id")
-        request_id = details.get("request_id")
-        existing = None
-        if request_id:
-            existing = conn.execute(
-                "SELECT id, status FROM crm_outreach_emails WHERE crm_company_id = ? AND client_request_id = ? ORDER BY created_at DESC LIMIT 1",
-                (company_id, request_id),
-            ).fetchone()
+    details = _resolve_outreach_persist_details(company_id, company.company_name if hasattr(company, 'company_name') else company.get('company_name'), payload, template_key=payload.get("template_key") or "introduction", sender_name=(payload.get("sender_name") or _default_sender_name()).strip(), sender_email=(payload.get("sender_email") or _default_sender_email()).strip())
+    body_with_signature = _append_signature(details["body"], sender_name=details["sender_name"], sender_email=details["sender_email"])
+    draft_id = payload.get("id")
+    request_id = details.get("request_id")
+    service = OutreachService()
+    existing = _get_outreach_by_request_id(company_id, request_id) if request_id else None
 
-        if draft_id:
-            conn.execute(
-                """
-                UPDATE crm_outreach_emails
-                SET subject = ?, body = ?, recipient = ?, recipient_name = ?, sender_name = ?, sender_email = ?, template_key = ?, template_name = ?, company_name = ?, contact_name = ?, crm_contact_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND crm_company_id = ?
-                """,
-                (details["subject"], body_with_signature, details["recipient"], details["recipient_name"], details["sender_name"], details["sender_email"], details["template_key"], details["template_name"], details["company_name"], details["contact_name"], details["contact_id"], int(draft_id), company_id),
-            )
-            row_id = int(draft_id)
-            add_activity(conn, company_id, "email", "Draft updated", f"Updated draft for {company['company_name']}")
-        elif existing and existing["status"] != "sent":
-            conn.execute(
-                """
-                UPDATE crm_outreach_emails
-                SET subject = ?, body = ?, recipient = ?, recipient_name = ?, sender_name = ?, sender_email = ?, template_key = ?, template_name = ?, company_name = ?, contact_name = ?, crm_contact_id = ?, client_request_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND crm_company_id = ?
-                """,
-                (details["subject"], body_with_signature, details["recipient"], details["recipient_name"], details["sender_name"], details["sender_email"], details["template_key"], details["template_name"], details["company_name"], details["contact_name"], details["contact_id"], request_id, int(existing["id"]), company_id),
-            )
-            row_id = int(existing["id"])
-            add_activity(conn, company_id, "email", "Draft updated", f"Updated draft for {company['company_name']}")
-        else:
-            cursor = conn.execute(
-                """
-                INSERT INTO crm_outreach_emails (crm_company_id, crm_contact_id, template_key, template_name, subject, body, recipient, recipient_name, sender_name, sender_email, company_name, contact_name, status, client_request_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (company_id, details["contact_id"], details["template_key"], details["template_name"], details["subject"], body_with_signature, details["recipient"], details["recipient_name"], details["sender_name"], details["sender_email"], details["company_name"], details["contact_name"], "draft", request_id),
-            )
-            row_id = int(cursor.lastrowid)
-            add_activity(conn, company_id, "email", "Email drafted", f"Saved draft for {company['company_name']}")
+    if draft_id:
+        updated = service.update_outreach(int(draft_id), {
+            "subject": details["subject"],
+            "body": body_with_signature,
+            "recipient": details["recipient"],
+            "recipient_name": details["recipient_name"],
+            "sender_name": details["sender_name"],
+            "sender_email": details["sender_email"],
+            "template_key": details["template_key"],
+            "template_name": details["template_name"],
+            "company_name": details["company_name"],
+            "contact_name": details["contact_name"],
+            "crm_contact_id": details["contact_id"],
+            "client_request_id": request_id,
+        })
+        row = _to_plain_dict(updated)
+        row_id = int(row.get("id") or 0)
+        CompanyService().add_activity(company_id, "email", "Draft updated", f"Updated draft for {company.company_name if hasattr(company, 'company_name') else company.get('company_name')}")
+    elif existing:
+        updated = service.update_outreach(int(existing.get("id") or 0), {
+            "subject": details["subject"],
+            "body": body_with_signature,
+            "recipient": details["recipient"],
+            "recipient_name": details["recipient_name"],
+            "sender_name": details["sender_name"],
+            "sender_email": details["sender_email"],
+            "template_key": details["template_key"],
+            "template_name": details["template_name"],
+            "company_name": details["company_name"],
+            "contact_name": details["contact_name"],
+            "crm_contact_id": details["contact_id"],
+            "client_request_id": request_id,
+        })
+        row = _to_plain_dict(updated)
+        row_id = int(row.get("id") or 0)
+        CompanyService().add_activity(company_id, "email", "Draft updated", f"Updated draft for {company.company_name if hasattr(company, 'company_name') else company.get('company_name')}")
+    else:
+        created = service.create_outreach(company_id, {
+            "crm_company_id": company_id,
+            "crm_contact_id": details["contact_id"],
+            "template_key": details["template_key"],
+            "template_name": details["template_name"],
+            "subject": details["subject"],
+            "body": body_with_signature,
+            "recipient": details["recipient"],
+            "recipient_name": details["recipient_name"],
+            "sender_name": details["sender_name"],
+            "sender_email": details["sender_email"],
+            "company_name": details["company_name"],
+            "contact_name": details["contact_name"],
+            "status": "draft",
+            "client_request_id": request_id,
+        })
+        row = _to_plain_dict(created)
+        row_id = int(row.get("id") or 0)
+        CompanyService().add_activity(company_id, "email", "Email drafted", f"Saved draft for {company.company_name if hasattr(company, 'company_name') else company.get('company_name')}")
 
-        conn.commit()
-        return jsonify({"success": True, "draft_id": row_id, "status": "draft"})
-    finally:
-        conn.close()
+    return jsonify({"success": True, "draft_id": row_id, "status": "draft"})
 
 
 @app.route("/api/crm/companies/<int:company_id>/outreach/send", methods=["POST"])
@@ -2846,167 +2220,128 @@ def send_outreach_email(company_id):
     if not subject or not body:
         return jsonify({"success": False, "error": "subject and body are required"}), 400
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    company = CompanyService().get_company(company_id)
+    if not company:
+        abort(404)
 
-        details = _resolve_outreach_persist_details(conn, company_id, company["company_name"], payload, template_key=payload.get("template_key") or "introduction", sender_name=(payload.get("sender_name") or _default_sender_name()).strip(), sender_email=(payload.get("sender_email") or _default_sender_email()).strip())
-        sender_name = details["sender_name"]
-        sender_email = details["sender_email"]
-        from_email = (payload.get("from_email") or _default_from_email()).strip()
-        request_id = details.get("request_id")
-        if request_id:
-            existing = conn.execute(
-                "SELECT id, status, message_id FROM crm_outreach_emails WHERE crm_company_id = ? AND client_request_id = ? ORDER BY created_at DESC LIMIT 1",
-                (company_id, request_id),
-            ).fetchone()
-            if existing and existing["status"] == "sent":
-                return jsonify({"success": True, "status": "sent", "email_id": int(existing["id"]), "message_id": existing["message_id"], "duplicate": True})
+    details = _resolve_outreach_persist_details(company_id, company.company_name if hasattr(company, 'company_name') else company.get('company_name'), payload, template_key=payload.get("template_key") or "introduction", sender_name=(payload.get("sender_name") or _default_sender_name()).strip(), sender_email=(payload.get("sender_email") or _default_sender_email()).strip())
+    sender_name = details["sender_name"]
+    sender_email = details["sender_email"]
+    from_email = (payload.get("from_email") or _default_from_email()).strip()
+    request_id = details.get("request_id")
+    service = OutreachService()
+    existing = _get_outreach_by_request_id(company_id, request_id) if request_id else None
+    if existing and (existing.get("status") if isinstance(existing, dict) else getattr(existing, "status", None)) == "sent":
+        return jsonify({"success": True, "status": "sent", "email_id": int(existing.get("id") or 0), "message_id": existing.get("message_id"), "duplicate": True})
 
-        body_with_signature = _append_signature(details["body"], sender_name=sender_name, sender_email=sender_email)
-        success, message_id, error_message = _send_via_resend(details["subject"], body_with_signature, details["recipient"], from_email, sender_name, sender_email)
-        status = "sent" if success else "failed"
+    body_with_signature = _append_signature(details["body"], sender_name=sender_name, sender_email=sender_email)
+    success, message_id, error_message = _send_via_resend(details["subject"], body_with_signature, details["recipient"], from_email, sender_name, sender_email)
+    status = "sent" if success else "failed"
 
-        existing_row_id = None
-        if request_id:
-            existing_row = conn.execute(
-                "SELECT id FROM crm_outreach_emails WHERE crm_company_id = ? AND client_request_id = ? ORDER BY created_at DESC LIMIT 1",
-                (company_id, request_id),
-            ).fetchone()
-            if existing_row:
-                existing_row_id = int(existing_row["id"])
+    if existing:
+        updated = service.update_outreach(int(existing.get("id") or 0), {
+            "crm_contact_id": details["contact_id"],
+            "template_key": details["template_key"],
+            "template_name": details["template_name"],
+            "subject": details["subject"],
+            "body": body_with_signature,
+            "recipient": details["recipient"],
+            "recipient_name": details["recipient_name"],
+            "sender_name": sender_name,
+            "sender_email": sender_email,
+            "from_email": from_email,
+            "company_name": details["company_name"],
+            "contact_name": details["contact_name"],
+            "status": status,
+            "message_id": message_id,
+            "error_message": error_message,
+            "client_request_id": request_id,
+            "sent_at": now_iso(),
+        })
+        row = _to_plain_dict(updated)
+    else:
+        created = service.create_outreach(company_id, {
+            "crm_company_id": company_id,
+            "crm_contact_id": details["contact_id"],
+            "template_key": details["template_key"],
+            "template_name": details["template_name"],
+            "subject": details["subject"],
+            "body": body_with_signature,
+            "recipient": details["recipient"],
+            "recipient_name": details["recipient_name"],
+            "sender_name": sender_name,
+            "sender_email": sender_email,
+            "from_email": from_email,
+            "company_name": details["company_name"],
+            "contact_name": details["contact_name"],
+            "status": status,
+            "message_id": message_id,
+            "error_message": error_message,
+            "client_request_id": request_id,
+            "sent_at": now_iso(),
+        })
+        row = _to_plain_dict(created)
 
-        if existing_row_id is not None:
-            conn.execute(
-                """
-                UPDATE crm_outreach_emails
-                SET crm_contact_id = ?, template_key = ?, template_name = ?, subject = ?, body = ?, recipient = ?, recipient_name = ?, sender_name = ?, sender_email = ?, from_email = ?, company_name = ?, contact_name = ?, status = ?, message_id = ?, error_message = ?, client_request_id = ?, sent_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND crm_company_id = ?
-                """,
-                (
-                    details["contact_id"],
-                    details["template_key"],
-                    details["template_name"],
-                    details["subject"],
-                    body_with_signature,
-                    details["recipient"],
-                    details["recipient_name"],
-                    sender_name,
-                    sender_email,
-                    from_email,
-                    details["company_name"],
-                    details["contact_name"],
-                    status,
-                    message_id,
-                    error_message,
-                    request_id,
-                    existing_row_id,
-                    company_id,
-                ),
-            )
-            row_id = existing_row_id
-        else:
-            row = conn.execute(
-                """
-                INSERT INTO crm_outreach_emails (crm_company_id, crm_contact_id, template_key, template_name, subject, body, recipient, recipient_name, sender_name, sender_email, from_email, company_name, contact_name, status, message_id, error_message, client_request_id, sent_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """,
-                (
-                    company_id,
-                    details["contact_id"],
-                    details["template_key"],
-                    details["template_name"],
-                    details["subject"],
-                    body_with_signature,
-                    details["recipient"],
-                    details["recipient_name"],
-                    sender_name,
-                    sender_email,
-                    from_email,
-                    details["company_name"],
-                    details["contact_name"],
-                    status,
-                    message_id,
-                    error_message,
-                    request_id,
-                ),
-            )
-            row_id = int(row.lastrowid)
+    row_id = int(row.get("id") or 0)
 
-        if success:
-            add_activity(conn, company_id, "email", "Email sent", f"Sent outreach email for {company['company_name']}")
-        else:
-            add_activity(conn, company_id, "email", "Email failed", f"Failed to send outreach email for {company['company_name']}: {error_message}")
-        conn.commit()
-        return jsonify({"success": success, "status": status, "email_id": row_id, "message_id": message_id, "error": error_message})
-    finally:
-        conn.close()
+    if success:
+        CompanyService().add_activity(company_id, "email", "Email sent", f"Sent outreach email for {company.company_name if hasattr(company, 'company_name') else company.get('company_name')}")
+    else:
+        CompanyService().add_activity(company_id, "email", "Email failed", f"Failed to send outreach email for {company.company_name if hasattr(company, 'company_name') else company.get('company_name')}: {error_message}")
+    return jsonify({"success": success, "status": status, "email_id": row_id, "message_id": message_id, "error": error_message})
 
 
 @app.route("/api/crm/companies/<int:company_id>/outreach/history")
 def get_outreach_history(company_id):
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id, company_name FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
-        rows = conn.execute(
-            "SELECT id, crm_company_id, crm_contact_id, template_key, template_name, subject, body, recipient, recipient_name, sender_name, sender_email, from_email, company_name, contact_name, status, message_id, error_message, created_at, updated_at, sent_at FROM crm_outreach_emails WHERE crm_company_id = ? ORDER BY created_at DESC",
-            (company_id,),
-        ).fetchall()
-        items = [
-            {
-                "id": int(row["id"]),
-                "companyId": int(row["crm_company_id"]),
-                "contactId": int(row["crm_contact_id"]) if row["crm_contact_id"] is not None else None,
-                "templateKey": row["template_key"],
-                "templateName": row["template_name"] or row["template_key"],
-                "subject": row["subject"],
-                "body": row["body"],
-                "recipient": row["recipient"],
-                "recipientName": row["recipient_name"],
-                "senderName": row["sender_name"],
-                "senderEmail": row["sender_email"],
-                "fromEmail": row["from_email"],
-                "companyName": row["company_name"],
-                "contactName": row["contact_name"],
-                "status": row["status"],
-                "messageId": row["message_id"],
-                "errorMessage": row["error_message"],
-                "createdAt": row["created_at"],
-                "updatedAt": row["updated_at"],
-                "sentAt": row["sent_at"],
-            }
-            for row in rows
-        ]
-        return jsonify({"success": True, "items": items})
-    finally:
-        conn.close()
+    company = CompanyService().get_company(company_id)
+    if not company:
+        abort(404)
+    items = []
+    for row in OutreachService().list_outreach(company_id, page=1, per_page=100).get("items", []):
+        item = _to_plain_dict(row)
+        items.append({
+            "id": int(item.get("id") or 0),
+            "companyId": int(item.get("crm_company_id") or company_id),
+            "contactId": int(item.get("crm_contact_id")) if item.get("crm_contact_id") is not None else None,
+            "templateKey": item.get("template_key"),
+            "templateName": item.get("template_name") or item.get("template_key"),
+            "subject": item.get("subject"),
+            "body": item.get("body"),
+            "recipient": item.get("recipient"),
+            "recipientName": item.get("recipient_name"),
+            "senderName": item.get("sender_name"),
+            "senderEmail": item.get("sender_email"),
+            "fromEmail": item.get("from_email"),
+            "companyName": item.get("company_name"),
+            "contactName": item.get("contact_name"),
+            "status": item.get("status"),
+            "messageId": item.get("message_id"),
+            "errorMessage": item.get("error_message"),
+            "createdAt": item.get("created_at"),
+            "updatedAt": item.get("updated_at"),
+            "sentAt": item.get("sent_at"),
+        })
+    return jsonify({"success": True, "items": items})
 
 
 @app.route("/api/crm/contacts/outreach/summary")
 def get_contact_outreach_summary():
-    conn = connect()
-    try:
-        rows = conn.execute(
-            "SELECT crm_contact_id, status, subject, created_at FROM crm_outreach_emails WHERE crm_contact_id IS NOT NULL ORDER BY created_at DESC",
-            (),
-        ).fetchall()
-        latest_by_contact = {}
-        for row in rows:
-            contact_id = int(row["crm_contact_id"])
-            if contact_id not in latest_by_contact:
-                latest_by_contact[contact_id] = {
-                    "contactId": contact_id,
-                    "status": row["status"],
-                    "subject": row["subject"],
-                    "sentAt": row["created_at"],
-                }
-        return jsonify({"success": True, "items": list(latest_by_contact.values())})
-    finally:
-        conn.close()
+    repo = OutreachRepository()
+    rows = repo.list(filters={"crm_contact_id": ("neq", None)}, order="created_at.desc", limit=100)
+    latest_by_contact = {}
+    for row in rows:
+        item = _to_plain_dict(row)
+        contact_id = int(item.get("crm_contact_id") or 0)
+        if not contact_id:
+            continue
+        if contact_id not in latest_by_contact:
+            latest_by_contact[contact_id] = {
+                "contactId": contact_id,
+                "status": item.get("status"),
+                "subject": item.get("subject"),
+                "sentAt": item.get("created_at"),
+            }
+    return jsonify({"success": True, "items": list(latest_by_contact.values())})
 
 
 @app.route("/api/crm/companies/<int:company_id>/contacts", methods=["POST"])
@@ -3016,30 +2351,14 @@ def add_company_contact(company_id):
     if not full_name:
         return jsonify({"error": "full_name is required"}), 400
 
-    # Legacy sqlite
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            if not company:
-                abort(404)
-
-            contact_id = create_contact(conn, company_id, payload)
-            add_activity(conn, company_id, "contact", "Contact added", f"Added contact {full_name}")
-            conn.commit()
-            contact = conn.execute("SELECT id, crm_company_id, full_name, role, department, email, phone, source, created_at FROM crm_contacts WHERE id = ?", (contact_id,)).fetchone()
-            return jsonify({"success": True, "contact": _row_to_dict(contact)})
-        finally:
-            conn.close()
-
-    # Supabase path
-    company = companies_repo.get_company(company_id)
+    company = CompanyService().get_company(company_id)
     if not company:
         abort(404)
-    new_id = companies_repo.create_contact(company_id, payload)
-    companies_repo.add_activity(company_id, "contact", "Contact added", f"Added contact {full_name}")
-    contact = companies_repo.db.get_by_id("crm_contacts", new_id)
-    return jsonify({"success": True, "contact": contact})
+
+    service = ContactService()
+    contact = service.create_contact(company_id, payload)
+    logger.info("Added contact %s for company_id=%d", full_name, company_id)
+    return jsonify({"success": True, "contact": contact if isinstance(contact, dict) else vars(contact)})
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks", methods=["POST"])
@@ -3049,85 +2368,51 @@ def add_company_task(company_id):
     if not title:
         return jsonify({"error": "title is required"}), 400
 
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            if not company:
-                abort(404)
-
-            task_id = create_task(conn, company_id, payload)
-            add_activity(conn, company_id, "task", "Task assigned", f"Assigned task {title}")
-            conn.commit()
-            task = conn.execute("SELECT id, crm_company_id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE id = ?", (task_id,)).fetchone()
-            return jsonify({"success": True, "task": _row_to_dict(task)})
-        finally:
-            conn.close()
-
-    company = companies_repo.get_company(company_id)
+    company = CompanyService().get_company(company_id)
     if not company:
         abort(404)
-    new_id = companies_repo.create_task(company_id, payload)
-    companies_repo.add_activity(company_id, "task", "Task assigned", f"Assigned task {title}")
-    task = companies_repo.db.get_by_id("crm_tasks", new_id)
-    return jsonify({"success": True, "task": task})
+
+    service = TaskService()
+    task = service.create_task(company_id, payload)
+    logger.info("Assigned task %s for company_id=%d", title, company_id)
+    return jsonify({"success": True, "task": task if isinstance(task, dict) else vars(task)})
 
 
 @app.route("/api/crm/companies/<int:company_id>/notes", methods=["POST"])
 def add_company_note(company_id):
+    """Create a note for a company."""
     payload = request.get_json(silent=True) or {}
     body = (payload.get("body") or "").strip()
     if not body:
         return jsonify({"error": "body is required"}), 400
 
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-            if not company:
-                abort(404)
-
-            note_id = add_note(conn, company_id, body)
-            add_activity(conn, company_id, "note", "Note created", body)
-            conn.commit()
-            note = conn.execute("SELECT id, crm_company_id, body, created_at FROM crm_notes WHERE id = ?", (note_id,)).fetchone()
-            return jsonify({"success": True, "note": _row_to_dict(note)})
-        finally:
-            conn.close()
-
-    company = companies_repo.get_company(company_id)
+    company = CompanyService().get_company(company_id)
     if not company:
         abort(404)
-    new_id = companies_repo.add_note(company_id, body)
-    companies_repo.add_activity(company_id, "note", "Note created", body)
-    note = companies_repo.db.get_by_id("crm_notes", new_id)
-    return jsonify({"success": True, "note": note})
+
+    try:
+        service = CompanyService()
+        note = service.add_note(company_id, body)
+        logger.info("Added note to company_id=%d", company_id)
+        return jsonify({"success": True, "note": note if isinstance(note, dict) else vars(note)})
+    except Exception as e:
+        logger.error("Error adding note: %s", str(e))
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks/<int:task_id>/complete", methods=["POST"])
 def complete_company_task(company_id, task_id):
+    """Mark a task as complete."""
     try:
-        if os.getenv("MEDNOVA_DB_PATH"):
-            conn = connect()
-            try:
-                company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-                if not company:
-                    abort(404)
-
-                task = complete_task(conn, company_id, task_id)
-                conn.commit()
-                return jsonify({"success": True, "task": _row_to_dict(task)})
-            finally:
-                conn.close()
-
-        # Supabase path
-        company = companies_repo.get_company(company_id)
-        if not company:
-            abort(404)
-        task = companies_repo.complete_task(company_id, task_id)
-        return jsonify({"success": True, "task": task})
+        service = TaskService()
+        task = service.complete_task(task_id, company_id)
+        logger.info("Completed task_id=%d for company_id=%d", task_id, company_id)
+        return jsonify({"success": True, "task": task if isinstance(task, dict) else vars(task)})
     except LookupError:
         return jsonify({"error": "task not found"}), 404
+    except Exception as e:
+        logger.error("Error completing task: %s", str(e))
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks/<int:task_id>", methods=["PATCH"])
@@ -3139,174 +2424,164 @@ def update_company_task(company_id, task_id):
     if not updates:
         return jsonify({"error": "no updatable fields provided"}), 400
 
-    conn = connect()
-    try:
-        task = conn.execute("SELECT * FROM crm_tasks WHERE id = ? AND crm_company_id = ?", (task_id, company_id)).fetchone()
-        if not task:
-            abort(404)
+    service = TaskService()
+    task = service.get_task(task_id)
+    if not task:
+        abort(404)
 
-        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
-        params = list(updates.values()) + [task_id, company_id]
-        sql = f"UPDATE crm_tasks SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND crm_company_id = ?"
-        conn.execute(sql, tuple(params))
+    task_company_id = task.crm_company_id if hasattr(task, "crm_company_id") else task.get("crm_company_id")
+    if int(task_company_id or 0) != int(company_id):
+        abort(404)
 
-        if "status" in updates:
-            if updates.get("status") == "completed":
-                conn.execute("UPDATE crm_tasks SET completed_at = ? WHERE id = ?", (datetime.now(timezone.utc).replace(microsecond=0).isoformat(), task_id))
-                add_activity(conn, company_id, "task", "Task completed", f"Completed task: {updates.get('title') or task['title']}")
-            else:
-                conn.execute("UPDATE crm_tasks SET completed_at = NULL WHERE id = ?", (task_id,))
-                add_activity(conn, company_id, "task", "Task reopened", f"Reopened task: {updates.get('title') or task['title']}")
+    activity_title = "Task updated"
+    if "status" in updates:
+        if updates.get("status") == "completed":
+            updates["completed_at"] = now_iso()
+            activity_title = "Task completed"
         else:
-            add_activity(conn, company_id, "task", "Task updated", f"Updated task: {updates.get('title') or task['title']}")
+            updates["completed_at"] = None
+            activity_title = "Task reopened"
 
-        conn.commit()
-        updated = conn.execute("SELECT id, crm_company_id, title, description, task_type, status, priority, due_date, assigned_to, completed_at, created_at FROM crm_tasks WHERE id = ?", (task_id,)).fetchone()
-        return jsonify({"success": True, "task": _row_to_dict(updated)})
-    finally:
-        conn.close()
+    updated_task = service.update_task(task_id, updates)
+    service.activity_repo.create({
+        "crm_company_id": company_id,
+        "activity_type": "task",
+        "title": activity_title,
+        "body": f"{activity_title}: {updates.get('title') or (task.title if hasattr(task, 'title') else task.get('title', 'Task'))}",
+        "created_at": now_iso(),
+    })
+
+    logger.info("Updated task_id=%d for company_id=%d", task_id, company_id)
+    return jsonify({"success": True, "task": updated_task if isinstance(updated_task, dict) else vars(updated_task)})
 
 
 @app.route("/api/crm/companies/<int:company_id>/tasks/<int:task_id>", methods=["DELETE"])
 def delete_company_task(company_id, task_id):
-    conn = connect()
+    """Delete a task."""
     try:
-        task = conn.execute("SELECT id, title FROM crm_tasks WHERE id = ? AND crm_company_id = ?", (task_id, company_id)).fetchone()
-        if not task:
-            abort(404)
-        conn.execute("DELETE FROM crm_tasks WHERE id = ? AND crm_company_id = ?", (task_id, company_id))
-        add_activity(conn, company_id, "task", "Task deleted", f"Deleted task: {task['title']}")
-        conn.commit()
+        service = TaskService()
+        service.delete_task(task_id, company_id)
+        logger.info("Deleted task_id=%d for company_id=%d", task_id, company_id)
         return jsonify({"success": True})
-    finally:
-        conn.close()
+    except LookupError:
+        abort(404)
+    except Exception as e:
+        logger.error("Error deleting task: %s", str(e))
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/crm/companies/<int:company_id>/intelligence", methods=["GET"])
 def get_company_intelligence(company_id):
-    conn = connect()
-    try:
-        intelligence = _infer_company_intelligence(conn, company_id, force_refresh=False)
-        return jsonify({"success": True, "intelligence": intelligence})
-    except LookupError:
+    service = IntelligenceService()
+    intelligence = service.get_intelligence(company_id)
+    if not intelligence:
         abort(404)
-    finally:
-        conn.close()
+    payload = _to_plain_dict(intelligence)
+    if isinstance(payload.get("data"), dict):
+        payload = {**payload, **payload.get("data", {})}
+    return jsonify({"success": True, "intelligence": payload})
 
 
 @app.route("/api/crm/companies/<int:company_id>/intelligence/refresh", methods=["POST"])
 def refresh_company_intelligence(company_id):
-    conn = connect()
-    try:
-        intelligence = _infer_company_intelligence(conn, company_id, force_refresh=True)
-        return jsonify({"success": True, "intelligence": intelligence})
-    except LookupError:
-        abort(404)
-    finally:
-        conn.close()
+    service = IntelligenceService()
+    intelligence = service.refresh_intelligence(company_id)
+    payload = _to_plain_dict(intelligence)
+    if isinstance(payload.get("data"), dict):
+        payload = {**payload, **payload.get("data", {})}
+    return jsonify({"success": True, "intelligence": payload})
 
 
 @app.route("/api/crm/companies/<int:company_id>/reports/generate", methods=["POST"])
 def generate_company_report(company_id):
-    conn = connect()
-    try:
-        report_payload = _build_company_report_payload(conn, company_id)
-        report_doc = _persist_report(conn, company_id, "company", f"{report_payload['company_name']} — Company Report", report_payload, report_payload.get("executive_summary"))
-        conn.commit()
-        return jsonify({"success": True, "report": report_doc})
-    except LookupError:
+    service = ReportService()
+    company = CompanyService().get_company(company_id)
+    if not company:
         abort(404)
-    finally:
-        conn.close()
+    report_payload = _build_company_report_payload(company_id)
+    report_doc = service.create_report({
+        "crm_company_id": company_id,
+        "report_type": "company",
+        "report_name": f"{report_payload['company_name']} — Company Report",
+        "report_data": report_payload,
+        "executive_summary": report_payload.get("executive_summary"),
+    })
+    report_payload_out = _to_plain_dict(report_doc)
+    if report_payload_out.get("crm_company_id") is not None:
+        report_payload_out["company_id"] = report_payload_out["crm_company_id"]
+    return jsonify({"success": True, "report": report_payload_out})
 
 
 @app.route("/api/crm/companies/<int:company_id>/reports", methods=["GET"])
 def list_company_reports(company_id):
-    conn = connect()
-    try:
-        reports = _load_reports(conn, company_id)
-        return jsonify({"reports": reports})
-    finally:
-        conn.close()
+    service = ReportService()
+    items = service.list_reports(company_id, page=1, per_page=100).get("items", [])
+    return jsonify({"reports": [_to_plain_dict(item) for item in items]})
 
 
 @app.route("/api/reports/operations/generate", methods=["POST"])
 def generate_operations_report():
-    conn = connect()
+    service = ReportService()
+    report_payload = _build_operations_report_payload()
     try:
-        report_payload = _build_operations_report_payload(conn)
-        report_doc = _persist_report(conn, None, "operations", "Operations Report", report_payload, report_payload.get("executive_summary"))
-        conn.commit()
-        return jsonify({"success": True, "report": report_doc})
-    finally:
-        conn.close()
+        report_doc = service.create_report({
+            "report_type": "operations",
+            "report_name": "Operations Report",
+            "report_data": report_payload,
+            "executive_summary": report_payload.get("executive_summary"),
+        })
+    except ValueError as exc:
+        logger.warning("Operations report not persisted: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 400
+    return jsonify({"success": True, "report": _to_plain_dict(report_doc)})
 
 
 @app.route("/api/reports", methods=["GET"])
 def list_reports():
-    conn = connect()
-    try:
-        return jsonify({"reports": _load_reports(conn)})
-    finally:
-        conn.close()
+    service = ReportService()
+    items = service.list_reports(page=1, per_page=100).get("items", [])
+    return jsonify({"reports": [_to_plain_dict(item) for item in items]})
 
 
 @app.route("/api/reports/<int:report_id>", methods=["GET"])
 def get_report(report_id):
-    conn = connect()
-    try:
-        row = conn.execute("SELECT id, crm_company_id, report_type, report_name, version, generated_by, generated_at, report_data, executive_summary, status, metadata FROM crm_reports WHERE id = ?", (report_id,)).fetchone()
-        if not row:
-            abort(404)
-        return jsonify({
-            "report": {
-                "id": int(row["id"]),
-                "crm_company_id": int(row["crm_company_id"]) if row["crm_company_id"] is not None else None,
-                "report_type": row["report_type"],
-                "report_name": row["report_name"],
-                "version": row["version"],
-                "generated_by": row["generated_by"],
-                "generated_at": row["generated_at"],
-                "report_data": json.loads(row["report_data"] or "{}"),
-                "executive_summary": row["executive_summary"],
-                "status": row["status"],
-                "metadata": json.loads(row["metadata"] or "{}"),
-            }
-        })
-    finally:
-        conn.close()
+    service = ReportService()
+    report = service.get_report(report_id)
+    if not report:
+        abort(404)
+    report_payload = _to_plain_dict(report)
+    report_payload["report_data"] = report_payload.get("report_data") or {}
+    return jsonify({"report": report_payload})
 
 
 @app.route("/api/reports/<int:report_id>/export", methods=["POST"])
 def export_report(report_id):
     payload = request.get_json(silent=True) or {}
     fmt = (payload.get("format") or "markdown").lower()
-    conn = connect()
-    try:
-        row = conn.execute("SELECT id, report_data, executive_summary, report_name FROM crm_reports WHERE id = ?", (report_id,)).fetchone()
-        if not row:
-            abort(404)
-        report_data = json.loads(row["report_data"] or "{}")
-        executive_summary = report_data.get("executive_summary") or row["executive_summary"] or ""
-        company_name = report_data.get("company_name") or report_data.get("summary", {}).get("company_name") or row["report_name"]
-        recommended_services = report_data.get("commercial_opportunity", {}).get("recommended_services") or report_data.get("service_opportunities") or []
-        risks = report_data.get("risk_assessment", {}).get("risks") or report_data.get("risk_analysis", {}).get("potential_risks") or []
-        action_plan = report_data.get("action_plan") or {}
+    service = ReportService()
+    report = service.get_report(report_id)
+    if not report:
+        abort(404)
+    report_payload = _to_plain_dict(report)
+    report_data = report_payload.get("report_data") or {}
+    executive_summary = report_data.get("executive_summary") or report_payload.get("executive_summary") or ""
+    company_name = report_data.get("company_name") or report_data.get("summary", {}).get("company_name") or report_payload.get("report_name")
+    recommended_services = report_data.get("commercial_opportunity", {}).get("recommended_services") or report_data.get("service_opportunities") or []
+    risks = report_data.get("risk_assessment", {}).get("risks") or report_data.get("risk_analysis", {}).get("potential_risks") or []
+    action_plan = report_data.get("action_plan") or {}
 
-        def _format_list(items):
-            if not items:
-                return "- None listed"
-            return "\n".join(f"- {item}" for item in items if item)
+    def _format_list(items):
+        if not items:
+            return "- None listed"
+        return "\n".join(f"- {item}" for item in items if item)
 
-        if fmt == "pdf":
-            content = f"# {row['report_name']}\n\n## Executive Summary\n\n{executive_summary}\n\n## Company Focus\n\n- Company: {company_name}\n- Priority Score: {report_data.get('commercial_opportunity', {}).get('priority_score', 'N/A')}\n- Opportunity Type: {report_data.get('commercial_assessment', {}).get('commercial_opportunity', 'N/A')}\n\n## Recommended Services\n\n{_format_list([service.get('service') if isinstance(service, dict) else str(service) for service in recommended_services])}\n\n## Risk Assessment\n\n{_format_list(risks)}\n\n## Action Plan\n\n{_format_list([value for values in action_plan.values() if isinstance(values, list) for value in values])}\n"
-        elif fmt == "docx":
-            content = f"# {row['report_name']}\n\n## Executive Summary\n\n{executive_summary}\n\n## Recommended Services\n\n{_format_list([service.get('service') if isinstance(service, dict) else str(service) for service in recommended_services])}\n"
-        else:
-            content = f"# {row['report_name']}\n\n## Executive Summary\n\n{executive_summary}\n\n## Recommended Services\n\n{_format_list([service.get('service') if isinstance(service, dict) else str(service) for service in recommended_services])}\n\n## Risk Assessment\n\n{_format_list(risks)}\n\n## Action Plan\n\n{_format_list([value for values in action_plan.values() if isinstance(values, list) for value in values])}\n"
-        return jsonify({"success": True, "format": fmt, "content": content, "download_name": f"{row['report_name'].lower().replace(' ', '-')}.{fmt}"})
-    finally:
-        conn.close()
+    if fmt == "pdf":
+        content = f"# {report_payload.get('report_name')}\n\n## Executive Summary\n\n{executive_summary}\n\n## Company Focus\n\n- Company: {company_name}\n- Priority Score: {report_data.get('commercial_opportunity', {}).get('priority_score', 'N/A')}\n- Opportunity Type: {report_data.get('commercial_assessment', {}).get('commercial_opportunity', 'N/A')}\n\n## Recommended Services\n\n{_format_list([service.get('service') if isinstance(service, dict) else str(service) for service in recommended_services])}\n\n## Risk Assessment\n\n{_format_list(risks)}\n\n## Action Plan\n\n{_format_list([value for values in action_plan.values() if isinstance(values, list) for value in values])}\n"
+    elif fmt == "docx":
+        content = f"# {report_payload.get('report_name')}\n\n## Executive Summary\n\n{executive_summary}\n\n## Recommended Services\n\n{_format_list([service.get('service') if isinstance(service, dict) else str(service) for service in recommended_services])}\n"
+    else:
+        content = f"# {report_payload.get('report_name')}\n\n## Executive Summary\n\n{executive_summary}\n\n## Recommended Services\n\n{_format_list([service.get('service') if isinstance(service, dict) else str(service) for service in recommended_services])}\n\n## Risk Assessment\n\n{_format_list(risks)}\n\n## Action Plan\n\n{_format_list([value for values in action_plan.values() if isinstance(values, list) for value in values])}\n"
+    return jsonify({"success": True, "format": fmt, "content": content, "download_name": f"{report_payload.get('report_name', 'report').lower().replace(' ', '-')}.{fmt}"})
 
 
 @app.route("/api/crm/companies/<int:company_id>/deals", methods=["POST"])
@@ -3315,116 +2590,96 @@ def add_company_deal(company_id):
     title = (payload.get("title") or "New deal").strip()
     if not title:
         return jsonify({"error": "title is required"}), 400
+    pipeline_service = PipelineService()
+    company_service = CompanyService()
 
-    conn = connect()
-    try:
-        company = conn.execute("SELECT id FROM crm_companies WHERE id = ?", (company_id,)).fetchone()
-        if not company:
-            abort(404)
+    stage = _crm_deal_stage_to_frontend(payload.get("stage"))
+    value = int(payload.get("value") or 0)
+    probability = max(0, min(100, int(payload.get("probability") or 0)))
+    expected_close_at = payload.get("expectedCloseAt") or payload.get("expected_close_at")
+    owner = (payload.get("owner") or "MedNovaOS").strip() or "MedNovaOS"
+    description = (payload.get("description") or "").strip()
+    contact_id = payload.get("contactId") or payload.get("contact_id")
+    if contact_id in {None, ""}:
+        contact_id = None
 
-        stage = _crm_deal_stage_to_frontend(payload.get("stage"))
-        value = int(payload.get("value") or 0)
-        probability = max(0, min(100, int(payload.get("probability") or 0)))
-        expected_close_at = payload.get("expectedCloseAt") or payload.get("expected_close_at")
-        owner = (payload.get("owner") or "MedNovaOS").strip() or "MedNovaOS"
-        description = (payload.get("description") or "").strip()
-        contact_id = payload.get("contactId") or payload.get("contact_id")
-        if contact_id is not None and contact_id != "":
-            contact = conn.execute("SELECT id FROM crm_contacts WHERE id = ? AND crm_company_id = ?", (int(contact_id), company_id)).fetchone()
-            if not contact:
-                contact_id = None
-            else:
-                contact_id = int(contact_id)
-        else:
-            contact_id = None
-
-        cursor = conn.execute(
-            """
-            INSERT INTO crm_deals (
-                crm_company_id, crm_contact_id, title, stage, value, currency, probability, expected_close_at, owner, description
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (company_id, contact_id, title, stage, value, payload.get("currency") or "NGN", probability, expected_close_at, owner, description),
-        )
-        deal_id = int(cursor.lastrowid)
-        add_activity(conn, company_id, "deal", "Deal created", f"Created deal {title} in {stage} stage")
-        conn.commit()
-        row = conn.execute("SELECT * FROM crm_deals WHERE id = ?", (deal_id,)).fetchone()
-        return jsonify({"success": True, "deal": _crm_deal_payload_from_row(row)})
-    finally:
-        conn.close()
+    created = pipeline_service.create_deal(company_id, {
+        "crm_contact_id": contact_id,
+        "title": title,
+        "stage": stage,
+        "value": value,
+        "currency": payload.get("currency") or "NGN",
+        "probability": probability,
+        "expected_close_at": expected_close_at,
+        "owner": owner,
+        "description": description,
+    })
+    company_service.add_activity(company_id, "deal", "Deal created", f"Created deal {title} in {stage} stage")
+    return jsonify({"success": True, "deal": _crm_deal_payload_from_row(created)})
 
 
 @app.route("/api/crm/companies/<int:company_id>/deals/<int:deal_id>", methods=["PATCH"])
 def update_company_deal(company_id, deal_id):
     payload = request.get_json(silent=True) or {}
-    conn = connect()
-    try:
-        deal = conn.execute("SELECT * FROM crm_deals WHERE id = ? AND crm_company_id = ?", (deal_id, company_id)).fetchone()
-        if not deal:
-            abort(404)
+    pipeline_service = PipelineService()
+    company_service = CompanyService()
 
-        updates = {}
-        if "title" in payload:
-            updates["title"] = (payload.get("title") or "New deal").strip()
-        if "stage" in payload:
-            updates["stage"] = _crm_deal_stage_to_frontend(payload.get("stage"))
-        if "value" in payload:
-            updates["value"] = int(payload.get("value") or 0)
-        if "probability" in payload:
-            updates["probability"] = max(0, min(100, int(payload.get("probability") or 0)))
-        if "expectedCloseAt" in payload:
-            updates["expected_close_at"] = payload.get("expectedCloseAt")
-        if "expected_close_at" in payload:
-            updates["expected_close_at"] = payload.get("expected_close_at")
-        if "owner" in payload:
-            updates["owner"] = (payload.get("owner") or "MedNovaOS").strip() or "MedNovaOS"
-        if "description" in payload:
-            updates["description"] = (payload.get("description") or "").strip()
-        if "contactId" in payload or "contact_id" in payload:
-            contact_value = payload.get("contactId", payload.get("contact_id"))
-            if contact_value in {None, ""}:
-                updates["crm_contact_id"] = None
-            else:
-                contact = conn.execute("SELECT id FROM crm_contacts WHERE id = ? AND crm_company_id = ?", (int(contact_value), company_id)).fetchone()
-                if contact:
-                    updates["crm_contact_id"] = int(contact_value)
-                else:
-                    updates["crm_contact_id"] = None
-        if not updates:
-            return jsonify({"error": "no updatable fields provided"}), 400
+    # verify exist
+    existing = pipeline_service.deal_repo.get_by_id(deal_id)
+    if not existing or (getattr(existing, 'crm_company_id', None) or existing.get('crm_company_id')) != company_id:
+        abort(404)
 
-        set_clause = ", ".join([f"{key} = ?" for key in updates.keys()])
-        params = list(updates.values()) + [deal_id, company_id]
-        conn.execute(f"UPDATE crm_deals SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND crm_company_id = ?", tuple(params))
-        if "stage" in payload and payload.get("stage") is not None and _crm_deal_stage_to_frontend(payload.get("stage")) != deal["stage"]:
-            if updates["stage"] in {"won", "lost"}:
-                title = "Deal won" if updates["stage"] == "won" else "Deal lost"
-                add_activity(conn, company_id, "deal", title, f"{title} deal {deal['title']}")
-            else:
-                add_activity(conn, company_id, "deal", "Deal moved", f"Moved deal {deal['title']} to {updates['stage']}")
+    updates = {}
+    if "title" in payload:
+        updates["title"] = (payload.get("title") or "New deal").strip()
+    if "stage" in payload:
+        updates["stage"] = _crm_deal_stage_to_frontend(payload.get("stage"))
+    if "value" in payload:
+        updates["value"] = int(payload.get("value") or 0)
+    if "probability" in payload:
+        updates["probability"] = max(0, min(100, int(payload.get("probability") or 0)))
+    if "expectedCloseAt" in payload:
+        updates["expected_close_at"] = payload.get("expectedCloseAt")
+    if "expected_close_at" in payload:
+        updates["expected_close_at"] = payload.get("expected_close_at")
+    if "owner" in payload:
+        updates["owner"] = (payload.get("owner") or "MedNovaOS").strip() or "MedNovaOS"
+    if "description" in payload:
+        updates["description"] = (payload.get("description") or "").strip()
+    if "contactId" in payload or "contact_id" in payload:
+        contact_value = payload.get("contactId", payload.get("contact_id"))
+        if contact_value in {None, ""}:
+            updates["crm_contact_id"] = None
         else:
-            add_activity(conn, company_id, "deal", "Deal updated", f"Updated deal {deal['title']}")
-        conn.commit()
-        row = conn.execute("SELECT * FROM crm_deals WHERE id = ?", (deal_id,)).fetchone()
-        return jsonify({"success": True, "deal": _crm_deal_payload_from_row(row)})
-    finally:
-        conn.close()
+            # rely on contact repository validation
+            updates["crm_contact_id"] = int(contact_value)
+    if not updates:
+        return jsonify({"error": "no updatable fields provided"}), 400
+
+    updated = pipeline_service.update_deal(deal_id, updates)
+    # activity
+    if "stage" in updates and updates.get("stage") != getattr(existing, "stage", None):
+        if updates["stage"] in {"won", "lost"}:
+            title = "Deal won" if updates["stage"] == "won" else "Deal lost"
+            company_service.add_activity(company_id, "deal", title, f"{title} deal {getattr(existing, 'title', existing.get('title'))}")
+        else:
+            company_service.add_activity(company_id, "deal", "Deal moved", f"Moved deal {getattr(existing, 'title', existing.get('title'))} to {updates['stage']}")
+    else:
+        company_service.add_activity(company_id, "deal", "Deal updated", f"Updated deal {getattr(existing, 'title', existing.get('title'))}")
+
+    return jsonify({"success": True, "deal": _crm_deal_payload_from_row(updated)})
 
 
 @app.route("/api/crm/companies/<int:company_id>/deals/<int:deal_id>", methods=["DELETE"])
 def delete_company_deal(company_id, deal_id):
-    conn = connect()
-    try:
-        deal = conn.execute("SELECT id, title FROM crm_deals WHERE id = ? AND crm_company_id = ?", (deal_id, company_id)).fetchone()
-        if not deal:
-            abort(404)
-        conn.execute("DELETE FROM crm_deals WHERE id = ? AND crm_company_id = ?", (deal_id, company_id))
-        add_activity(conn, company_id, "deal", "Deal deleted", f"Deleted deal {deal['title']}")
-        conn.commit()
-        return jsonify({"success": True})
-    finally:
-        conn.close()
+    pipeline_service = PipelineService()
+    company_service = CompanyService()
+    existing = pipeline_service.deal_repo.get_by_id(deal_id)
+    if not existing or (getattr(existing, 'crm_company_id', None) or existing.get('crm_company_id')) != company_id:
+        abort(404)
+    pipeline_service.delete_deal(deal_id)
+    company_service.add_activity(company_id, "deal", "Deal deleted", f"Deleted deal {getattr(existing, 'title', existing.get('title'))}")
+    return jsonify({"success": True})
 
 
 @app.route("/api/crm/companies/from-opportunity", methods=["POST"])
@@ -3433,30 +2688,19 @@ def add_company_to_crm():
     company_name = (payload.get("company_name") or payload.get("company") or "").strip()
     if not company_name:
         return jsonify({"error": "company_name is required"}), 400
-    # Legacy sqlite path
-    if os.getenv("MEDNOVA_DB_PATH"):
-        conn = connect()
-        try:
-            company_id, company_data, created = _upsert_crm_company(conn, company_name, payload)
-            company_row = conn.execute(
-                "SELECT id, company_name, country, opportunity_score, portfolio_summary, opportunity_status, pipeline_stage, created_at FROM crm_companies WHERE id = ?",
-                (company_id,),
-            ).fetchone()
-            return jsonify({
-                "success": True,
-                "company_id": company_id,
-                "company_name": company_row["company_name"] if company_row else company_data["company_name"],
-                "created": created,
-                "exists": not created,
-                "message": "Company added successfully" if created else "This company already exists in your CRM.",
-                "status": "created" if created else "exists",
-                "company": dict(company_row) if company_row else None,
-            })
-        finally:
-            conn.close()
 
-    # Supabase path
-    company_id, company_row, created = companies_repo.create_company_from_payload(payload)
+    crm_service = CRMService()
+    company_id, company_row, created = crm_service.create_company_from_payload(payload)
+
+    intelligence_service = IntelligenceService()
+    intelligence = intelligence_service.get_intelligence(company_id)
+    if intelligence is None or created:
+        try:
+            intelligence = intelligence_service.compute_intelligence(company_id)
+        except Exception:
+            logger.exception("Failed to enrich CRM company intelligence: %s", company_id)
+            intelligence = None
+
     return jsonify({
         "success": True,
         "company_id": company_id,
@@ -3466,6 +2710,7 @@ def add_company_to_crm():
         "message": "Company added successfully" if created else "This company already exists in your CRM.",
         "status": "created" if created else "exists",
         "company": company_row,
+        "intelligence": _to_plain_dict(intelligence) if intelligence else None,
     })
 
 
@@ -3487,26 +2732,17 @@ def dashboard_greenbook_sync():
 
 @app.route("/admin/sync/status")
 def admin_sync_status():
-    conn = connect()
-    try:
-        last_sync = conn.execute("SELECT started_at, status, products_added, products_updated, products_removed, duration_seconds, error_message FROM sync_history ORDER BY id DESC LIMIT 1").fetchone()
-        product_count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        return jsonify({
-            "last_sync": dict(last_sync) if last_sync else None,
-            "running": False,
-            "failed": bool(last_sync and last_sync["status"] == "failed"),
-            "products": product_count,
-            "last_duration": int(last_sync["duration_seconds"] or 0) if last_sync else 0,
-            "database_size": 0,
-        })
-    finally:
-        conn.close()
+    from backend.cloud.sync_to_supabase import get_last_cloud_sync_summary
+
+    summary = get_last_cloud_sync_summary()
+    if not summary:
+        summary = {"status": "idle", "mode": "supabase", "message": "No sync has been run yet."}
+    return jsonify(summary)
 
 
 @app.route("/admin/cloud-sync", methods=["POST"])
 def admin_cloud_sync():
-    summary = sync_sqlite_to_supabase()
-    return jsonify(summary)
+    return jsonify({"status": "skipped", "mode": "supabase", "message": "Cloud sync is managed through the Supabase-backed migration pipeline."})
 
 
 @app.route("/admin/cloud-sync/status")
@@ -3518,7 +2754,8 @@ def admin_cloud_sync_status():
 
 @app.route("/api/health")
 def health_check():
-    return jsonify({"status": "ok", "database": str(db_path())})
+    database_path = os.getenv("MEDNOVA_DB_PATH") or os.getenv("DATABASE_PATH") or str(BASE_DIR / "database" / "nafdac_intelligence.db")
+    return jsonify({"status": "ok", "database": database_path})
 
 
 @app.route("/health")
@@ -3528,15 +2765,11 @@ def health_check_alias():
 
 @app.route("/api/ready")
 def readiness_check():
-    try:
-        db_file = db_path()
-        conn = sqlite3.connect(db_file, timeout=5)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("SELECT 1")
-        conn.close()
-        return jsonify({"status": "ready", "database": str(db_file)})
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 503
+    from backend.database.db import SupabaseDB
+
+    db = SupabaseDB()
+    mode = "supabase" if db.client is not None else "sqlite"
+    return jsonify({"status": "ok", "mode": mode, "services": {"supabase": db.client is not None}})
 
 
 @app.route("/ready")
@@ -3549,7 +2782,7 @@ def cron_greenbook_sync():
     if not _verify_cron_secret():
         return jsonify({"success": False, "message": "Invalid or missing cron secret."}), 403
 
-    summary = run_sync(db_path())
+    summary = run_sync()
     return jsonify(summary)
 
 
